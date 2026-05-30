@@ -7,9 +7,9 @@ from collections.abc import Iterable
 
 # Configure logging
 logging.basicConfig(
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%m/%d/%Y %I:%M:%S %p',
-    level=logging.DEBUG
+    level=logging.DEBUG,
+    format='%(process)d %(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%m/%d/%Y %I:%M:%S %p'
 )
 
 log = logging.getLogger('modem')

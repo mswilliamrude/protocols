@@ -17,7 +17,7 @@ from modem.protocol.zmodem import ZMODEM
 def getc(size, timeout=1):
     r, _, _ = select.select([sys.stdin.fileno()], [], [], timeout)
     if r:
-        return sys.stdin.buffer.read(size)
+        return os.read(sys.stdin.fileno(), size)
     return b''
 
 def putc(data, timeout=1):
@@ -33,6 +33,9 @@ def main():
     parser.add_argument("files", nargs='+', help="The file(s) to send.")
     args = parser.parse_args()
 
+    import logging
+    logging.basicConfig(level=logging.DEBUG, format='SZ: %(asctime)s [%(levelname)s] %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
+    
     # Save tty state
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
@@ -42,6 +45,7 @@ def main():
         tty = termios.tcgetattr(fd)
         tty[3] = tty[3] & ~termios.ICANON & ~termios.ECHO & ~termios.ISIG
         tty[0] = tty[0] & ~termios.ICRNL & ~termios.INLCR
+        tty[1] = tty[1] & ~termios.OPOST
         termios.tcsetattr(fd, termios.TCSANOW, tty)
         
         z = ZMODEM(getc, putc)

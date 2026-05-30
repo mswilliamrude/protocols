@@ -114,8 +114,8 @@ class ZMODEM(Modem):
                 break
         
         # Send OO
-        self.putc('O', timeout)
-        self.putc('O', timeout)
+        self.putc(b'O', timeout)
+        self.putc(b'O', timeout)
         return True
 
     def _send_16_data(self, data, frameend, timeout):
@@ -125,8 +125,8 @@ class ZMODEM(Modem):
             mine = self.calc_crc16(chr(char), mine)
             self._send(char, timeout)
         
-        self.putc(chr(const.ZDLE), timeout)
-        self.putc(chr(frameend), timeout)
+        self.putc(bytes([const.ZDLE]), timeout)
+        self.putc(bytes([frameend]), timeout)
         mine = self.calc_crc16(chr(frameend), mine)
         
         self._send(mine >> 8, timeout)
@@ -145,19 +145,27 @@ class ZMODEM(Modem):
         N.B.: currently there are no control on the existence of files, so they
         will be silently overwritten.
         '''
+        self.recv_log_file = open('/tmp/opencode/rz_recv_raw.bin', 'wb')
+        
         # Loop until we established a connection, we expect to receive a
         # different packet than ZRQINIT
         kind = const.TIMEOUT
         while kind in [const.TIMEOUT, const.ZRQINIT]:
             self._send_zrinit(timeout)
-            kind = self._recv_header(timeout)[0]
+            res = self._recv_header(timeout)
+            if res is const.TIMEOUT or res is False:
+                kind = const.TIMEOUT
+            else:
+                kind = res[0]
 
         log.info('ZMODEM connection established')
 
+        file_count = 0
         # Receive files
         while kind != const.ZFIN:
             if kind == const.ZFILE:
-                self._recv_file(basedir, timeout, retry)
+                if self._recv_file(basedir, timeout, retry) is not False:
+                    file_count += 1
                 kind = const.TIMEOUT
             elif kind == const.ZFIN:
                 continue
@@ -168,7 +176,11 @@ class ZMODEM(Modem):
 
             while kind is const.TIMEOUT:
                 self._send_zrinit(timeout)
-                kind = self._recv_header(timeout)[0]
+                res = self._recv_header(timeout)
+                if res is const.TIMEOUT or res is False:
+                    kind = const.TIMEOUT
+                else:
+                    kind = res[0]
 
         # Acknowledge the ZFIN
         log.info('Received ZFIN, done receiving files')
@@ -181,6 +193,8 @@ class ZMODEM(Modem):
         if kind is not const.TIMEOUT:
             while kind not in [ord('O'), const.TIMEOUT]:
                 kind = self._recv(timeout)
+
+        return file_count
 
     def _recv(self, timeout):
         # Outer loop
@@ -222,13 +236,16 @@ class ZMODEM(Modem):
 
     def _recv_raw(self, timeout):
         char = self.getc(1, timeout)
-        if char == '':
+        if char == b'':
             return const.TIMEOUT
         if char is not const.TIMEOUT:
+            if hasattr(self, 'recv_log_file'):
+                self.recv_log_file.write(char)
+                self.recv_log_file.flush()
             char = ord(char)
         return char
 
-    def _recv_data(self, ack_file_pos, timeout):
+    def _recv_data(self, ack_file_pos, timeout, ack=True):
         # zack_header = [const.ZACK, 0, 0, 0, 0]
         pos = ack_file_pos
 
@@ -253,70 +270,73 @@ class ZMODEM(Modem):
             return const.ENDOFFRAME, data
         # Frame continues; ZACK expected
         elif sub_frame_kind == const.ZCRCQ:
-            self._send_pos_header(const.ZACK, pos, timeout)
+            if ack: self._send_pos_header(const.ZACK, pos, timeout)
             return const.FRAMEOK, data
         # Frame ends; ZACK expected
         elif sub_frame_kind == const.ZCRCW:
-            self._send_pos_header(const.ZACK, pos, timeout)
+            if ack: self._send_pos_header(const.ZACK, pos, timeout)
             return const.ENDOFFRAME, data
         else:
             return False, data
 
     def _recv_16_data(self, timeout):
         char = 0
-        data = []
+        data = bytearray()
         mine = 0
+        log.debug("Entering _recv_16_data")
         while char < 0x100:
             char = self._recv(timeout)
             if char is const.TIMEOUT:
-                return const.TIMEOUT, ''
+                log.debug("_recv_16_data timeout!")
+                return const.TIMEOUT, b''
             elif char < 0x100:
-                mine = self.calc_crc16(chr(char & 0xff), mine)
-                data.append(chr(char))
+                mine = self.calc_crc16(bytes([char & 0xff]), mine)
+                data.append(char)
 
         # Calculate our crc, unescape the sub_frame_kind
         sub_frame_kind = char ^ const.ZDLEESC
-        mine = self.calc_crc16(chr(sub_frame_kind), mine)
+        mine = self.calc_crc16(bytes([sub_frame_kind]), mine)
 
         # Read their crc
         rcrc = self._recv(timeout) << 0x08
         rcrc |= self._recv(timeout)
 
-        log.debug('My CRC = %08x, theirs = %08x' % (mine, rcrc))
+        log.debug('My CRC16 = %08x, theirs = %08x' % (mine, rcrc))
         if mine != rcrc:
-            log.error('Invalid CRC32')
-            return timeout, ''
+            log.error('Invalid CRC16')
+            return timeout, b''
         else:
-            return sub_frame_kind, ''.join(data)
+            return sub_frame_kind, bytes(data)
 
     def _recv_32_data(self, timeout):
-        char = 0
-        data = []
         mine = 0
-        while char < 0x100:
+        data = bytearray()
+        while True:
             char = self._recv(timeout)
             if char is const.TIMEOUT:
-                return const.TIMEOUT, ''
+                return const.TIMEOUT, b''
             elif char < 0x100:
-                mine = self.calc_crc32(chr(char & 0xff), mine)
-                data.append(chr(char))
+                mine = self.calc_crc32(bytes([char & 0xff]), mine)
+                data.append(char)
+            else:
+                break
 
         # Calculate our crc, unescape the sub_frame_kind
         sub_frame_kind = char ^ const.ZDLEESC
-        mine = self.calc_crc32(chr(sub_frame_kind), mine)
+        mine = self.calc_crc32(bytes([sub_frame_kind]), mine)
 
         # Read their crc
-        rcrc = self._recv(timeout)
+        rcrc = self._recv(timeout) << 0x00
         rcrc |= self._recv(timeout) << 0x08
         rcrc |= self._recv(timeout) << 0x10
         rcrc |= self._recv(timeout) << 0x18
 
-        log.debug('My CRC = %08x, theirs = %08x' % (mine, rcrc))
+        log.debug('My CRC32 = %08x, theirs = %08x' % (mine, rcrc))
         if mine != rcrc:
             log.error('Invalid CRC32')
-            return timeout, ''
+            return timeout, b''
         else:
-            return sub_frame_kind, ''.join(data)
+            return sub_frame_kind, bytes(data)
 
     def _recv_header(self, timeout, errors=10):
         header_length = 0
@@ -399,26 +419,24 @@ class ZMODEM(Modem):
             return 5, header
 
     def _recv_bin32_header(self, timeout):
-        '''
-        Receive a header with 32 bit CRC.
-        '''
         header = []
         mine = 0
+
         for x in range(0, 5):
             char = self._recv(timeout)
             if char is const.TIMEOUT:
                 return 0, False
             else:
-                mine = self.calc_crc32(chr(char), mine)
+                mine = self.calc_crc32(bytes([char]), mine)
                 header.append(char)
 
         # Read their crc
-        rcrc = self._recv(timeout)
+        rcrc = self._recv(timeout) << 0x00
         rcrc |= self._recv(timeout) << 0x08
         rcrc |= self._recv(timeout) << 0x10
         rcrc |= self._recv(timeout) << 0x18
 
-        log.debug('My CRC = %08x, theirs = %08x' % (mine, rcrc))
+        log.debug('My CRC32 = %08x, theirs = %08x' % (mine, rcrc))
         if mine != rcrc:
             log.error('Invalid CRC32 in header')
             return 0, False
@@ -455,7 +473,7 @@ class ZMODEM(Modem):
 
         # Read to see if we receive a carriage return
         char = self.getc(1, timeout)
-        if char == '\r':
+        if char == b'\r' or char == b'\x8d' or char == b'\n' or char == b'\x8a':
             # Expect a second one (which we discard)
             self.getc(1, timeout)
 
@@ -475,23 +493,32 @@ class ZMODEM(Modem):
         if char is const.TIMEOUT:
             return const.TIMEOUT
 
-        if char > '9':
-            if char < 'a' or char > 'f':
-                # Illegal character
-                return const.TIMEOUT
-            return ord(char) - ord('a') + 10
+        if isinstance(char, bytes) and len(char) > 0:
+            char = char[0]
+        elif isinstance(char, str) and len(char) > 0:
+            char = ord(char[0])
         else:
-            if char < '0':
+            return const.TIMEOUT
+            
+        if char > 57: # '9'
+            if char < 97 or char > 102: # 'a' to 'f'
+                if char >= 65 and char <= 70: # 'A' to 'F'
+                    return char - 65 + 10
                 # Illegal character
                 return const.TIMEOUT
-            return ord(char) - ord('0')
+            return char - 97 + 10
+        else:
+            if char < 48: # '0'
+                # Illegal character
+                return const.TIMEOUT
+            return char - 48
 
     def _recv_file(self, basedir, timeout, retry):
         log.info('Abort to receive a file in %s' % (basedir,))
         pos = 0
 
         # Read the data subpacket containing the file information
-        kind, data = self._recv_data(pos, timeout)
+        kind, data = self._recv_data(pos, timeout, ack=False)
         pos += len(data)
         if kind not in [const.FRAMEOK, const.ENDOFFRAME]:
             if kind is not const.TIMEOUT:
@@ -500,15 +527,18 @@ class ZMODEM(Modem):
             return False
 
         # We got the file name
-        part = data.split('\x00')
-        filename = part[0]
+        part = data.split(b'\x00')
+        filename = part[0].decode('utf-8', 'replace')
         filepath = os.path.join(basedir, os.path.basename(filename))
         fp = open(filepath, 'wb')
-        part = part[1].split(' ')
+        part = part[1].split(b' ')
         log.info('Meta %r' % (part,))
         size = int(part[0])
         # Date is octal (!?)
-        date = datetime.datetime.fromtimestamp(int(part[1], 8))
+        if len(part) > 1 and part[1]:
+            date = datetime.datetime.fromtimestamp(int(part[1], 8))
+        else:
+            date = datetime.datetime.now()
         # We ignore mode and serial number, whatever, dude :-)
 
         log.info('Receiving file "%s" with size %d, mtime %s' %
@@ -518,11 +548,33 @@ class ZMODEM(Modem):
         start = time.time()
         kind = None
         total_size = 0
-        while total_size < size:
-            kind, chunk_size = self._recv_file_data(fp.tell(), fp, timeout)
-            total_size += chunk_size
-            if kind == const.ZEOF:
+        
+        # Send initial ZRPOS
+        self._send_pos_header(const.ZRPOS, fp.tell(), timeout)
+        
+        while True:
+            header = self._recv_header(timeout)
+            if header is const.TIMEOUT or header is False:
                 break
+            kind = header[0]
+            
+            if kind == const.ZDATA:
+                # Read data subpackets
+                frame_kind = const.FRAMEOK
+                while frame_kind == const.FRAMEOK:
+                    frame_kind, chunk = self._recv_data(fp.tell(), timeout)
+                    if frame_kind in [const.ENDOFFRAME, const.FRAMEOK]:
+                        fp.write(chunk)
+                        total_size += len(chunk)
+            elif kind == const.ZEOF:
+                # File EOF reached
+                break
+            elif kind == const.ZNAK:
+                # Resend ZRPOS? Or wait?
+                pass
+            else:
+                log.info(f"Unexpected header during file transfer: {kind}")
+                pass
 
         # End of file
         speed = (total_size / (time.time() - start))
@@ -540,9 +592,11 @@ class ZMODEM(Modem):
         while dpos != pos:
             while kind != const.ZDATA:
                 if kind is const.TIMEOUT:
-                    return const.TIMEOUT, ''
+                    return const.TIMEOUT, 0
                 else:
                     header = self._recv_header(timeout)
+                    if header is const.TIMEOUT:
+                        return const.TIMEOUT, 0
                     kind = header[0]
 
             # Read until we are at the correct block
@@ -567,15 +621,15 @@ class ZMODEM(Modem):
         if char == const.ZDLE:
             self._send_esc(char, timeout)
         elif char in [0x8d, 0x0d] or not esc:
-            self.putc(chr(char), timeout)
+            self.putc(bytes([char]), timeout)
         elif char in [0x10, 0x90, 0x11, 0x91, 0x13, 0x93]:
             self._send_esc(char, timeout)
         else:
-            self.putc(chr(char), timeout)
+            self.putc(bytes([char]), timeout)
 
     def _send_esc(self, char, timeout):
-        self.putc(chr(const.ZDLE), timeout)
-        self.putc(chr(char ^ 0x40), timeout)
+        self.putc(bytes([const.ZDLE]), timeout)
+        self.putc(bytes([char ^ 0x40]), timeout)
 
     def _send_znak(self, pos, timeout):
         self._send_pos_header(const.ZNAK, pos, timeout)
@@ -596,13 +650,14 @@ class ZMODEM(Modem):
 
     def _send_hex_nibble(self, nibble, timeout):
         nibble &= 0x0f
-        self.putc('%x' % nibble, timeout)
+        self.putc(('%x' % nibble).encode('ascii'), timeout)
 
     def _send_hex_header(self, header, timeout):
-        self.putc(chr(const.ZPAD), timeout)
-        self.putc(chr(const.ZPAD), timeout)
-        self.putc(chr(const.ZDLE), timeout)
-        self.putc(chr(const.ZHEX), timeout)
+        log.debug(f'Sending hex header: {header}')
+        self.putc(bytes([const.ZPAD]), timeout)
+        self.putc(bytes([const.ZPAD]), timeout)
+        self.putc(bytes([const.ZDLE]), timeout)
+        self.putc(bytes([const.ZHEX]), timeout)
         mine = 0
 
         # Update CRC
@@ -614,8 +669,8 @@ class ZMODEM(Modem):
         self._send_hex(mine >> 0x08, timeout)
         self._send_hex(mine, timeout)
 
-        self.putc('\r', timeout)
-        self.putc('\n', timeout)
+        self.putc(b'\r', timeout)
+        self.putc(b'\n', timeout)
         self.putc(const.XON, timeout)
 
     def _send_zrinit(self, timeout):
