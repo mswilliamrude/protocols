@@ -12,9 +12,10 @@ class ZMODEM(Modem):
     object to write to.
     '''
     
-    def __init__(self, getc, putc, progress_callback=None):
+    def __init__(self, getc, putc, progress_callback=None, compress=False):
         super().__init__(getc, putc)
         self.progress_callback = progress_callback
+        self.compress_enabled = compress
 
 
     def send(self, files, retry=16, timeout=60):
@@ -40,7 +41,7 @@ class ZMODEM(Modem):
                 peer_zf1 = header[const.ZP2]
                 break
                 
-        can_zlib = (peer_zf1 & const.ZF1_CANZLIB) != 0
+        can_zlib = (peer_zf1 & const.ZF1_CANZLIB) != 0 and self.compress_enabled
         if can_zlib:
             log.info("Receiver supports inline ZLIB compression")
         
@@ -749,6 +750,7 @@ class ZMODEM(Modem):
 
     def _send_zrinit(self, timeout):
         log.debug('Sending ZRINIT header')
-        header = [const.ZRINIT, 0, 0, const.ZF1_CANZLIB, 4 | const.ZF0_CANFDX |
+        zf1 = const.ZF1_CANZLIB if self.compress_enabled else 0
+        header = [const.ZRINIT, 0, 0, zf1, 4 | const.ZF0_CANFDX |
                   const.ZF0_CANOVIO | const.ZF0_CANFC32]
         self._send_hex_header(header, timeout)

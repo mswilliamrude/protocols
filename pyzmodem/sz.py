@@ -34,6 +34,7 @@ def main():
     parser.add_argument("--request", type=str, help="Request the remote wrapper to upload a file to you.")
     parser.add_argument("--directory", type=str, default=".", help="Directory to save requested files into.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+    parser.add_argument("-c", "--compress", action="store_true", help="Force inline ZLIB compression if supported by receiver.")
     args = parser.parse_args()
 
     import logging
@@ -71,7 +72,7 @@ def main():
         except termios.error:
             pass
         
-        z = ZMODEM(getc, putc)
+        z = ZMODEM(getc, putc, compress=args.compress)
         
         if args.request:
             # We are receiving the file we just requested

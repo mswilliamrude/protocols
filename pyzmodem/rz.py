@@ -60,6 +60,12 @@ def main():
     )
     
     parser.add_argument(
+        '-c', '--compress',
+        action='store_true',
+        help="Advertise inline ZLIB compression support and use it if sender agrees"
+    )
+    
+    parser.add_argument(
         'command',
         nargs=argparse.REMAINDER,
         help="Optional command to run in a PTY wrapper (e.g. ssh user@host)"
@@ -238,7 +244,7 @@ def main():
                                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                             except termios.error:
                                 pass
-                            z = ZMODEM(wrapper_getc, wrapper_putc, progress_callback=upload_progress)
+                            z = ZMODEM(wrapper_getc, wrapper_putc, progress_callback=upload_progress, compress=args.compress)
                             try:
                                 success = z.send([upload_path])
                             except KeyboardInterrupt:
@@ -288,7 +294,7 @@ def main():
                             except termios.error:
                                 pass
                             sys.stderr.write("[PyZMODEM] Tip: Press Ctrl+C to abort the transfer.\r\n")
-                            z = ZMODEM(wrapper_getc, wrapper_putc, progress_callback=progress)
+                            z = ZMODEM(wrapper_getc, wrapper_putc, progress_callback=progress, compress=args.compress)
                             try:
                                 count = z.recv(args.directory)
                             except KeyboardInterrupt:
@@ -355,7 +361,7 @@ def main():
             except termios.error:
                 pass
             
-            z = ZMODEM(getc, putc)
+            z = ZMODEM(getc, putc, compress=args.compress)
             
             # Start receiver loop
             # The recv() method in xyzmodem returns the number of files received.
