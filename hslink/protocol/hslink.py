@@ -24,7 +24,12 @@ class HSLinkSession:
         self.state = "INIT"
         self.last_tx_time = 0
         
-        # File Sender State (Sliding Window)
+        # File Receiver State
+        self.recv_dir = "."
+        self.recv_file = None
+        self.recv_fd = None
+        self.recv_batch_index = 0
+        self.recv_expected_block = 0
         self.files_to_send = []
         self.current_file = None
         self.current_fd = None
@@ -68,13 +73,18 @@ class HSLinkSession:
 
     def _pump_sender(self):
         """Pumps the sliding window file sender queue."""
+        # If we are done, don't pump
+        if self.state == "DONE":
+            return
+            
         # 1. Start a new file if our pipeline is idle
         if not self.current_file:
             if not self.files_to_send:
-                if self.state != "DONE":
+                # Only signal done if we actually sent files (or initiated as a sender)
+                if self.batch_index > 0:
                     log.info("All files transmitted.")
                     self.framer.send_packet(PACK_TRANSMIT_DONE, b"")
-                    self.state = "DONE"
+                # Wait for the peer to send Z to complete
                 return
             self._open_next_file()
 
@@ -141,6 +151,14 @@ class HSLinkSession:
             if self.state == "INIT":
                 self.state = "TRANSFERRING"
                 log.info("Handshake sync complete. Connection established.")
+                # We should ping back once immediately so the other side knows we synced
+                self.framer.send_packet(PACK_READY, b"")
+                self.framer.send_packet(PACK_READY_RECV, b"")
+                
+                # If we are the receiver and have no files to send, we should immediately signal that our send queue is empty
+                if not self.files_to_send:
+                    log.info("Send queue empty, sending PACK_TRANSMIT_DONE (Z) immediately.")
+                    self.framer.send_packet(PACK_TRANSMIT_DONE, b"")
                 
         elif pkt_type == PACK_ACK_BLOCK:
             seq = SequencePacket.unpack(payload)
@@ -161,11 +179,51 @@ class HSLinkSession:
                 
         elif pkt_type == PACK_OPEN_FILE:
             header = FileHeaderPacket.unpack(payload)
-            log.info(f"Peer requested to open file: {header['name'].decode('utf-8', 'ignore')}")
+            filename = header['name'].decode('utf-8', 'ignore')
+            log.info(f"Peer requested to open file: {filename} ({header['size']} bytes)")
             
-        else:
-            log.debug(f"Unhandled packet type: {pkt_type!r} length: {len(payload)}")
-
+            filepath = os.path.join(self.recv_dir, filename)
+            self.recv_fd = open(filepath, 'wb')
+            self.recv_file = filepath
+            self.recv_batch_index = header['batch']
+            self.recv_expected_block = 0
+            
+        elif pkt_type == PACK_DATA_BLOCK_SMD:
+            # Type D: Sequence + Mapping + Data
+            seq_size = SequencePacket.SIZE
+            map_size = ControlMapping.SIZE
+            
+            seq = SequencePacket.unpack(payload[:seq_size])
+            chunk = payload[seq_size + map_size:]
+            
+            if seq['batch'] == self.recv_batch_index:
+                if seq['block'] == self.recv_expected_block:
+                    if self.recv_fd:
+                        self.recv_fd.write(chunk)
+                    self.recv_expected_block += 1
+                
+                # Always ACK the received block to keep the sender's window moving
+                ack_payload = SequencePacket.pack(seq['batch'], seq['block'])
+                self.framer.send_packet(PACK_ACK_BLOCK, ack_payload)
+                
+        elif pkt_type == PACK_CLOSE_FILE:
+            if self.recv_fd:
+                self.recv_fd.close()
+                self.recv_fd = None
+                log.info(f"File {self.recv_file} successfully received and closed.")
+                self.recv_file = None
+                
+        elif pkt_type == PACK_TRANSMIT_DONE:
+            log.info("Peer signaled all files transmitted (Z).")
+            # If we are also not sending anything, we can gracefully complete
+            if not self.files_to_send and not self.current_file:
+                log.info("Receive queue empty, transitioning to DONE.")
+                self.state = "DONE"
+                
+                # If we were strictly a receiver, let's also tell the sender we are done 
+                # (so it doesn't wait indefinitely if it finished sending but hadn't received our Z)
+                self.framer.send_packet(PACK_TRANSMIT_DONE, b"")
+                
     def loop(self):
         """
         Blocks and runs the session until carrier is lost or session naturally completes.
@@ -174,6 +232,8 @@ class HSLinkSession:
             self.step()
             
             # If we've successfully finished our side of the send, sleep briefly to flush and exit.
-            if self.state == "DONE" and not self.files_to_send and not self.current_file:
+            if self.state == "DONE":
                 time.sleep(0.5)
+                # Ensure the transport knows we're done so it closes down
+                self.transport.carrier_lost = True
                 break

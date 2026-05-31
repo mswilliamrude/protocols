@@ -61,8 +61,13 @@ class FileHeaderPacket:
     @classmethod
     def unpack(cls, data):
         unpacked = struct.unpack(cls.FORMAT, data)
+        # Handle null-terminated 8.3 filename parsing correctly
+        raw_name = unpacked[0]
+        if b'\x00' in raw_name:
+            raw_name = raw_name.split(b'\x00')[0]
+            
         return {
-            'name': unpacked[0].rstrip(b'\x00'),
+            'name': raw_name,
             'size': unpacked[1],
             'blocks': unpacked[2],
             'BlockSize': unpacked[3],

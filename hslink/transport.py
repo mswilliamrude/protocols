@@ -76,13 +76,12 @@ class StdioTransport(Transport):
         for key, mask in events:
             if mask & selectors.EVENT_READ:
                 try:
-                    data = os.read(self.fd_in, 4096)
+                    data = os.read(self.fd_in, 8192)
                     if data:
                         self.in_buffer.extend(data)
                     else:
                         # 0 bytes read on a ready socket means EOF (Carrier Lost)
-                        self.carrier_lost = True 
-                        return False
+                        self.carrier_lost = True
                 except BlockingIOError:
                     pass
                 except OSError as e:
