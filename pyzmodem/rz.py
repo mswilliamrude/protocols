@@ -246,7 +246,7 @@ def main():
                                 pass
                             z = ZMODEM(wrapper_getc, wrapper_putc, progress_callback=upload_progress, compress=args.compress)
                             try:
-                                success = z.send([upload_path])
+                                success = z.send([upload_path], overwrite=True)
                             except KeyboardInterrupt:
                                 sys.stderr.write(f"\r\n[PyZMODEM] Transfer interrupted by user.\r\n")
                                 # Send 5 CAN bytes to tell remote to abort

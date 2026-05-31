@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--directory", type=str, default=".", help="Directory to save requested files into.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
     parser.add_argument("-c", "--compress", action="store_true", help="Force inline ZLIB compression if supported by receiver.")
+    parser.add_argument("-y", "--overwrite", action="store_true", help="Force the receiver to overwrite existing files instead of resuming.")
     args = parser.parse_args()
 
     import logging
@@ -93,7 +94,7 @@ def main():
         else:
             # Normal send mode
             try:
-                success = z.send(args.files)
+                success = z.send(args.files, overwrite=args.overwrite)
             except KeyboardInterrupt:
                 print("\r\n[PyZMODEM] Transfer interrupted by user.\r\n", file=sys.stderr)
                 try:

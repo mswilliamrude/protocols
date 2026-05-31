@@ -18,7 +18,7 @@ class ZMODEM(Modem):
         self.compress_enabled = compress
 
 
-    def send(self, files, retry=16, timeout=60):
+    def send(self, files, retry=16, timeout=60, overwrite=False):
         '''
         Send one or more files using ZMODEM protocol.
         files is a list of file paths.
@@ -59,7 +59,8 @@ class ZMODEM(Modem):
             
             # Send ZFILE header (Hex is fine, or BIN)
             zf1 = const.ZF1_ZLIB if can_zlib else 0
-            self._send_hex_header([const.ZFILE, 0, 0, zf1, 0], timeout)
+            zf3 = const.ZF3_OVERWRITE if overwrite else 0
+            self._send_hex_header([const.ZFILE, 0, 0, zf1, zf3], timeout)
             
             # Send ZFILE data
             # Format: filename \x00 filesize \x00
@@ -571,6 +572,10 @@ class ZMODEM(Modem):
         if is_zlib:
             log.info("ZLIB inline decompression enabled for this file")
 
+        force_overwrite = (zfile_header[const.ZP3] & const.ZF3_OVERWRITE) != 0 if len(zfile_header) > const.ZP3 else False
+        if force_overwrite:
+            log.info("Sender requested forced overwrite for this file")
+
         # Read the data subpacket containing the file information
         kind, data = self._recv_data(pos, timeout, ack=False)
         pos += len(data)
@@ -586,11 +591,13 @@ class ZMODEM(Modem):
         filepath = os.path.join(basedir, os.path.basename(filename))
         
         file_size_on_disk = 0
-        if os.path.exists(filepath):
+        if os.path.exists(filepath) and not force_overwrite:
             file_size_on_disk = os.path.getsize(filepath)
             fp = open(filepath, 'ab')
             log.info('File exists, resuming from offset %d' % file_size_on_disk)
         else:
+            if force_overwrite and os.path.exists(filepath):
+                log.info('File exists, but overwrite requested')
             fp = open(filepath, 'wb')
             
         part = part[1].split(b' ')

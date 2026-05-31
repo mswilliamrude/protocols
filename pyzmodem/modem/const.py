@@ -471,3 +471,6 @@ CRC32_MAP = [
 # PyZMODEM custom ZLIB feature flags
 ZF1_CANZLIB = 0x02  # Receiver capability flag in ZRINIT ZF1
 ZF1_ZLIB = 0x02     # Sender file flag in ZFILE ZF1
+
+# PyZMODEM custom overwrite flag
+ZF3_OVERWRITE = 0x01  # Sender file flag in ZFILE ZF3 to force overwrite
