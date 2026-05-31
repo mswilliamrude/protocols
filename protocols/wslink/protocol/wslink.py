@@ -35,6 +35,7 @@ class WSLinkSession:
         self.recv_file_time = 0.0
         
         # Bandwidth & Congestion Control
+        self.block_size = 4096  # Configurable block size
         self.window_size = 16
         self.max_window_size = 256
         self.block_send_times = {}
@@ -85,7 +86,7 @@ class WSLinkSession:
         filepath = self.files_to_send.pop(0)
         st = os.stat(filepath)
         size = st.st_size
-        blocks = (size + MAX_BLOCK_SIZE - 1) // MAX_BLOCK_SIZE
+        blocks = (size + self.block_size - 1) // self.block_size
         
         log.info(f"Opening file: {filepath} ({size} bytes)")
         
@@ -94,7 +95,7 @@ class WSLinkSession:
             name=filename,
             size=size,
             blocks=blocks,
-            block_size=MAX_BLOCK_SIZE,
+            block_size=self.block_size,
             time_float=st.st_mtime,
             batch=self.batch_index
         )
@@ -111,7 +112,7 @@ class WSLinkSession:
         filepath = self.files_to_send.pop(0)
         st = os.stat(filepath)
         size = st.st_size
-        blocks = (size + MAX_BLOCK_SIZE - 1) // MAX_BLOCK_SIZE
+        blocks = (size + self.block_size - 1) // self.block_size
         
         log.info(f"Opening file: {filepath} ({size} bytes)")
         
@@ -120,7 +121,7 @@ class WSLinkSession:
             name=filename,
             size=size,
             blocks=blocks,
-            block_size=MAX_BLOCK_SIZE,
+            block_size=self.block_size,
             time_float=st.st_mtime,
             batch=self.batch_index
         )
@@ -161,7 +162,7 @@ class WSLinkSession:
                 
         # Fill Window
         while len(self.unacked_blocks) < self.window_size and self.next_block_num < self.total_blocks:
-            chunk = self.current_fd.read(MAX_BLOCK_SIZE)
+            chunk = self.current_fd.read(self.block_size)
             if not chunk:
                 break
                 
@@ -259,8 +260,8 @@ class WSLinkSession:
                         count = 0
                         crcs = bytearray()
                         while count < 100: # Verify up to 100 blocks
-                            chunk = f.read(MAX_BLOCK_SIZE)
-                            if len(chunk) < MAX_BLOCK_SIZE:
+                            chunk = f.read(self.block_size)
+                            if len(chunk) < self.block_size:
                                 break
                             crc_val = zlib.crc32(chunk) & 0xFFFFFFFF
                             crcs.extend(struct.pack('<I', crc_val))
@@ -309,11 +310,11 @@ class WSLinkSession:
             count = v_header['count']
             log.info(f"Peer requested VERIFY for {count} blocks starting at {base_block}.")
             
-            self.current_fd.seek(base_block * MAX_BLOCK_SIZE)
+            self.current_fd.seek(base_block * self.block_size)
             verified = 0
             offset = ResumeVerifyPacket.HEADER_SIZE
             for _ in range(count):
-                chunk = self.current_fd.read(MAX_BLOCK_SIZE)
+                chunk = self.current_fd.read(self.block_size)
                 if not chunk: break
                 expected_crc = struct.unpack('<I', payload[offset:offset+4])[0]
                 if (zlib.crc32(chunk) & 0xFFFFFFFF) == expected_crc:
@@ -324,7 +325,7 @@ class WSLinkSession:
                     
             log.info(f"Verified {verified} blocks. Seeking sender to block {base_block + verified}.")
             self.next_block_num = base_block + verified
-            self.current_fd.seek(self.next_block_num * MAX_BLOCK_SIZE)
+            self.current_fd.seek(self.next_block_num * self.block_size)
             self.unacked_blocks.clear()
             self.block_send_times.clear()
             
