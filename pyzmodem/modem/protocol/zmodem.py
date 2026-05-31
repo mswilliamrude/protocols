@@ -262,14 +262,6 @@ class ZMODEM(Modem):
                     raise KeyboardInterrupt("Transfer cancelled by peer")
             else:
                 self._can_count = 0
-            
-            if char_val == 0x03: # Ctrl+C
-                self._ctrlc_count = getattr(self, '_ctrlc_count', 0) + 1
-                if self._ctrlc_count >= 2:
-                    log.info("Received consecutive Ctrl+C, aborting")
-                    raise KeyboardInterrupt("Transfer cancelled by user")
-            else:
-                self._ctrlc_count = 0
                 
             return char_val
         return char

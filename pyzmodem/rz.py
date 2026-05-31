@@ -54,12 +54,30 @@ def main():
     )
     
     parser.add_argument(
+        '--debug',
+        action='store_true',
+        help="Enable debug logging"
+    )
+    
+    parser.add_argument(
         'command',
         nargs=argparse.REMAINDER,
         help="Optional command to run in a PTY wrapper (e.g. ssh user@host)"
     )
     
     args = parser.parse_args()
+    
+    import logging
+    log_level = logging.DEBUG if args.debug else logging.ERROR
+    logging.basicConfig(level=log_level, format='RZ: %(asctime)s [%(levelname)s] %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p', force=True)
+    
+    if args.debug:
+        # In debug mode, log to a file so it doesn't mess up the terminal
+        file_handler = logging.FileHandler('/tmp/pyzmodem_rz_debug.log')
+        file_handler.setFormatter(logging.Formatter('RZ: %(asctime)s [%(levelname)s] %(message)s'))
+        logging.getLogger().addHandler(file_handler)
+        logging.getLogger().propagate = False
+        sys.stderr.write("\r\n[PyZMODEM] Debug logging enabled. See /tmp/pyzmodem_rz_debug.log on local machine.\r\n")
     
     if args.command:
         # PTY Wrapper mode
@@ -156,10 +174,12 @@ def main():
                             # lrzsz sends "rz\r" before the signature, intercept it too
                             if idx >= 3 and data[idx-3:idx] == b'rz\r':
                                 idx -= 3
+                            logging.debug(f"Found **\\x18B00 at index {idx}")
                         elif b'**\x18B01' in data:
                             idx = data.find(b'**\x18B01')
                             if idx >= 3 and data[idx-3:idx] == b'rz\r':
                                 idx -= 3
+                            logging.debug(f"Found **\\x18B01 at index {idx}")
                         else:
                             idx = 0
                         
@@ -202,6 +222,7 @@ def main():
                                     upload_path = potential_path
                                     
                             sys.stderr.write(f"\r\n\033[K[PyZMODEM] Local wrapper requested to upload {upload_path}...\r\n")
+                            sys.stderr.write("[PyZMODEM] Tip: Press Ctrl+C to abort the transfer.\r\n")
                             
                             def upload_progress(filename, total_size, uploaded):
                                 if total_size > 0:
@@ -221,6 +242,11 @@ def main():
                                 success = z.send([upload_path])
                             except KeyboardInterrupt:
                                 sys.stderr.write(f"\r\n[PyZMODEM] Transfer interrupted by user.\r\n")
+                                # Send 5 CAN bytes to tell remote to abort
+                                try:
+                                    wrapper_putc(b'\x18\x18\x18\x18\x18', 1)
+                                except Exception:
+                                    pass
                                 success = False
                             finally:
                                 # Put back into raw mode
@@ -260,11 +286,17 @@ def main():
                                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                             except termios.error:
                                 pass
+                            sys.stderr.write("[PyZMODEM] Tip: Press Ctrl+C to abort the transfer.\r\n")
                             z = ZMODEM(wrapper_getc, wrapper_putc, progress_callback=progress)
                             try:
                                 count = z.recv(args.directory)
                             except KeyboardInterrupt:
                                 sys.stderr.write(f"\r\n[PyZMODEM] Transfer interrupted by user.\r\n")
+                                # Send 5 CAN bytes to tell remote to abort
+                                try:
+                                    wrapper_putc(b'\x18\x18\x18\x18\x18', 1)
+                                except Exception:
+                                    pass
                                 count = 0
                             finally:
                                 # Put back into raw mode
@@ -312,7 +344,7 @@ def main():
             sys.stdout.write(f"rz-request:{args.request}\r\n")
             sys.stdout.flush()
             
-        print("\r\n[PyZMODEM] Tip: Press Ctrl+C or Ctrl+X to abort the transfer at any time.\r\n", file=sys.stderr)
+        print("\r\n[PyZMODEM] Tip: Press Ctrl+X 5 times to abort the transfer at any time.\r\n", file=sys.stderr)
             
         try:
             # Set raw mode
@@ -330,6 +362,10 @@ def main():
                 count = z.recv(args.directory)
             except KeyboardInterrupt:
                 print("\r\n[PyZMODEM] Transfer interrupted by user.\r\n", file=sys.stderr)
+                try:
+                    putc(b'\x18\x18\x18\x18\x18', 1)
+                except Exception:
+                    pass
                 count = 0
             
             if count:
