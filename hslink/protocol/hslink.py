@@ -90,22 +90,33 @@ class HSLinkSession:
                 return
             self._open_next_file()
 
+        # ARQ Timeout Logic: Resend oldest unacked block if we've been waiting too long
+        if self.unacked_blocks:
+            current_time = time.time()
+            if not hasattr(self, 'last_arq_time'):
+                self.last_arq_time = current_time
+            elif current_time - self.last_arq_time > 2.0:
+                oldest_block = min(self.unacked_blocks.keys())
+                log.warning(f"ARQ Timeout! Resending block {oldest_block}")
+                
+                stored_payload = self.unacked_blocks[oldest_block]
+                # stored_payload already contains Seq + Map + Data because of our previous patch
+                self.framer.send_packet(PACK_DATA_BLOCK_SMD, stored_payload)
+                self.last_arq_time = current_time
+
         # 2. Fill the sliding window with packets up to window_size
         while len(self.unacked_blocks) < self.window_size and self.next_block_num < self.total_blocks:
             chunk = self.current_fd.read(MAX_BLOCK_SIZE)
             if not chunk:
                 break
                 
-            # Optimization Cascade: Block 0 sends D (Seq+Map+Data). Subsequent blocks send F (Data only).
+            # Send D (Seq+Map+Data) for all blocks to guarantee sequence robustness over noisy lines.
             seq_bytes = SequencePacket.pack(self.batch_index, self.next_block_num)
-            if self.next_block_num == 0:
-                map_bytes = ControlMapping.pack(XON_CHR, XOFF_CHR, DLE_CHR, START_PACKET_CHR, END_PACKET_CHR)
-                payload = seq_bytes + map_bytes + chunk
-                self.unacked_blocks[self.next_block_num] = payload
-                self.framer.send_packet(PACK_DATA_BLOCK_SMD, payload)
-            else:
-                self.unacked_blocks[self.next_block_num] = seq_bytes + chunk # Keep seq so NAK resends can use D
-                self.framer.send_packet(PACK_DATA_BLOCK_D, chunk)
+            map_bytes = ControlMapping.pack(XON_CHR, XOFF_CHR, DLE_CHR, START_PACKET_CHR, END_PACKET_CHR)
+            payload = seq_bytes + map_bytes + chunk
+            
+            self.unacked_blocks[self.next_block_num] = payload
+            self.framer.send_packet(PACK_DATA_BLOCK_SMD, payload)
                 
             self.next_block_num += 1
 
@@ -174,6 +185,7 @@ class HSLinkSession:
                 cleared = [k for k in self.unacked_blocks.keys() if k <= ack_block]
                 for k in cleared:
                     del self.unacked_blocks[k]
+                self.last_arq_time = time.time()
 
         elif pkt_type == PACK_NAK_BLOCK:
             seq = SequencePacket.unpack(payload)
@@ -181,12 +193,9 @@ class HSLinkSession:
                 nak_block = seq['block']
                 if nak_block in self.unacked_blocks:
                     log.warning(f"Received NAK for block {nak_block}. Resending.")
-                    # Always resend using D (Seq+Map+Data) so the receiver explicitly knows the out-of-order sequence
+                    # Always resend using D (Seq+Map+Data)
                     stored_payload = self.unacked_blocks[nak_block]
-                    map_bytes = ControlMapping.pack(XON_CHR, XOFF_CHR, DLE_CHR, START_PACKET_CHR, END_PACKET_CHR)
-                    seq_bytes = stored_payload[:SequencePacket.SIZE]
-                    chunk = stored_payload[SequencePacket.SIZE:]
-                    self.framer.send_packet(PACK_DATA_BLOCK_SMD, seq_bytes + map_bytes + chunk)
+                    self.framer.send_packet(PACK_DATA_BLOCK_SMD, stored_payload)
                 
         elif pkt_type == PACK_OPEN_FILE:
             header = FileHeaderPacket.unpack(payload)
@@ -242,13 +251,27 @@ class HSLinkSession:
                     if self.recv_fd:
                         self.recv_fd.write(chunk)
                     self.recv_expected_block += 1
-                
-                # Always ACK the received block to keep the sender's window moving
-                ack_payload = SequencePacket.pack(seq['batch'], seq['block'])
-                self.framer.send_packet(PACK_ACK_BLOCK, ack_payload)
+                    
+                    # ACK the successfully received block
+                    ack_payload = SequencePacket.pack(seq['batch'], seq['block'])
+                    self.framer.send_packet(PACK_ACK_BLOCK, ack_payload)
+                elif seq['block'] > self.recv_expected_block:
+                    # We missed a block! Send a NAK for the expected block
+                    log.warning(f"Out of order block {seq['block']} received, expecting {self.recv_expected_block}. Sending NAK.")
+                    nak_payload = SequencePacket.pack(seq['batch'], self.recv_expected_block)
+                    self.framer.send_packet(PACK_NAK_BLOCK, nak_payload)
+                else:
+                    # Duplicate block (seq < expected). Just ACK it again so sender can move on
+                    ack_payload = SequencePacket.pack(seq['batch'], seq['block'])
+                    self.framer.send_packet(PACK_ACK_BLOCK, ack_payload)
                 
         elif pkt_type == PACK_DATA_BLOCK_D:
             # Type F: Data Only (Optimization Cascade)
+            # Since F blocks do NOT contain a sequence number, they implicitly mean "expected_block"
+            # But wait, if an F block is corrupted, we won't know until the NEXT D block?
+            # Actually, the framer throws away the corrupted F block.
+            # The sender won't get an ACK for it. The sender will eventually timeout or we will send NAK.
+            # For now, we assume if we get an F block it is the expected block.
             chunk = payload
             if self.recv_fd:
                 self.recv_fd.write(chunk)
@@ -266,10 +289,7 @@ class HSLinkSession:
                 if nak_block in self.unacked_blocks:
                     log.warning(f"Received ExtNAK for block {nak_block}. Resending full block.")
                     stored_payload = self.unacked_blocks[nak_block]
-                    map_bytes = ControlMapping.pack(XON_CHR, XOFF_CHR, DLE_CHR, START_PACKET_CHR, END_PACKET_CHR)
-                    seq_bytes = stored_payload[:SequencePacket.SIZE]
-                    chunk = stored_payload[SequencePacket.SIZE:]
-                    self.framer.send_packet(PACK_DATA_BLOCK_SMD, seq_bytes + map_bytes + chunk)
+                    self.framer.send_packet(PACK_DATA_BLOCK_SMD, stored_payload)
                     
         elif pkt_type == PACK_SKIP_FILE:
             log.info(f"Peer requested SKIP for file: {self.current_file}")
