@@ -1,0 +1,15 @@
+# wslink packet types
+PACK_ACK_BLOCK = b'A'
+PACK_CLOSE_FILE = b'C'
+PACK_DATA_BLOCK = b'D'  # Single data block type
+PACK_CHAT_BLOCK = b'H'
+PACK_SKIP_FILE = b'K'
+PACK_NAK_BLOCK = b'N'   # Replaces M as well
+PACK_OPEN_FILE = b'O'
+PACK_READY_RECV = b'Q'
+PACK_READY = b'R'
+PACK_SEEK_BLOCK = b'S'
+PACK_VERIFY_BLOCK = b'V'
+PACK_TRANSMIT_DONE = b'Z'
+
+MAX_BLOCK_SIZE = 4096
