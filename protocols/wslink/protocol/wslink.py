@@ -39,6 +39,8 @@ class WSLinkSession:
         self.window_size = kwargs.get('initial_window', 16)
         self.max_window_size = kwargs.get('max_window', 256)
         self.arq_timeout = kwargs.get('arq_timeout', 2.0)
+        self.verify_limit = kwargs.get('verify_limit', 100)
+        self.rtt_history_size = kwargs.get('rtt_history_size', 20)
         self.block_send_times = {}
         self.rtt_history = []
         
@@ -186,7 +188,7 @@ class WSLinkSession:
 
     def _update_rtt(self, rtt: float):
         self.rtt_history.append(rtt)
-        if len(self.rtt_history) > 20:
+        if len(self.rtt_history) > self.rtt_history_size:
             self.rtt_history.pop(0)
             
         avg_rtt = sum(self.rtt_history) / len(self.rtt_history)
@@ -260,7 +262,7 @@ class WSLinkSession:
                     with open(filepath, 'rb') as f:
                         count = 0
                         crcs = bytearray()
-                        while count < 100: # Verify up to 100 blocks
+                        while count < self.verify_limit: # Configurable verification chunking
                             chunk = f.read(self.block_size)
                             if len(chunk) < self.block_size:
                                 break
