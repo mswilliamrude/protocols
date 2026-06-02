@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--directory", type=str, default=".", help="Directory to save requested files into.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
     parser.add_argument("-c", "--compress", action="store_true", help="Force inline ZLIB compression if supported by receiver.")
+    parser.add_argument("-e", "--escape", action="store_true", help="Escape all control characters (safe for sudo/use_pty wrappers).")
     parser.add_argument("-y", "--overwrite", action="store_true", help="Force the receiver to overwrite existing files instead of resuming.")
     args = parser.parse_args()
 
@@ -73,7 +74,7 @@ def main():
         except termios.error:
             pass
         
-        z = ZMODEM(getc, putc, compress=args.compress)
+        z = ZMODEM(getc, putc, compress=args.compress, escape_all=args.escape)
         
         if args.request:
             # We are receiving the file we just requested

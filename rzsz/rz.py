@@ -66,6 +66,12 @@ def main():
     )
     
     parser.add_argument(
+        '-e', '--escape',
+        action='store_true',
+        help="Escape all control characters (safe for sudo/use_pty wrappers)"
+    )
+    
+    parser.add_argument(
         'command',
         nargs=argparse.REMAINDER,
         help="Optional command to run in a PTY wrapper (e.g. ssh user@host)"
@@ -134,7 +140,16 @@ def main():
             stdout_fd = sys.stdout.fileno()
             
             while True:
-                r, _, _ = select.select([fd, master_fd], [], [])
+                try:
+                    r, _, _ = select.select([fd, master_fd], [], [])
+                except KeyboardInterrupt:
+                    # In environments like MSYS2/Git Bash, Ctrl+C may still raise
+                    # KeyboardInterrupt even in raw mode. Forward it to the child.
+                    try:
+                        os.write(master_fd, b'\x03')
+                    except OSError:
+                        pass
+                    continue
                 
                 if fd in r:
                     try:
@@ -247,7 +262,7 @@ def main():
                                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                             except termios.error:
                                 pass
-                            z = ZMODEM(wrapper_getc, wrapper_putc, progress_callback=upload_progress, compress=args.compress)
+                            z = ZMODEM(wrapper_getc, wrapper_putc, progress_callback=upload_progress, compress=args.compress, escape_all=args.escape)
                             try:
                                 success = z.send([upload_path], overwrite=True)
                             except KeyboardInterrupt:
@@ -275,7 +290,10 @@ def main():
                             # If we were interrupted on the remote side, flush garbage out of the pipe
                             if flush_needed:
                                 while True:
-                                    rr, _, _ = select.select([master_fd], [], [], 0.1)
+                                    try:
+                                        rr, _, _ = select.select([master_fd], [], [], 0.1)
+                                    except KeyboardInterrupt:
+                                        continue
                                     if not rr:
                                         break
                                     try:
@@ -297,7 +315,7 @@ def main():
                             except termios.error:
                                 pass
                             sys.stderr.write("[PyZMODEM] Tip: Press Ctrl+C to abort the transfer.\r\n")
-                            z = ZMODEM(wrapper_getc, wrapper_putc, progress_callback=progress, compress=args.compress)
+                            z = ZMODEM(wrapper_getc, wrapper_putc, progress_callback=progress, compress=args.compress, escape_all=args.escape)
                             try:
                                 count = z.recv(args.directory)
                             except KeyboardInterrupt:
@@ -325,7 +343,10 @@ def main():
                             # If we were interrupted or failed, flush any garbage out of the pipe
                             if flush_needed:
                                 while True:
-                                    rr, _, _ = select.select([master_fd], [], [], 0.1)
+                                    try:
+                                        rr, _, _ = select.select([master_fd], [], [], 0.1)
+                                    except KeyboardInterrupt:
+                                        continue
                                     if not rr:
                                         break
                                     try:
@@ -341,7 +362,7 @@ def main():
         finally:
             try:
                 if old_settings:
-                termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+                    termios.tcsetattr(fd, termios.TCSANOW, old_settings)
             except termios.error:
                 pass
             
@@ -368,7 +389,7 @@ def main():
             except termios.error:
                 pass
             
-            z = ZMODEM(getc, putc, compress=args.compress)
+            z = ZMODEM(getc, putc, compress=args.compress, escape_all=args.escape)
             
             # Start receiver loop
             # The recv() method in xyzmodem returns the number of files received.
@@ -389,7 +410,7 @@ def main():
         finally:
             try:
                 if old_settings:
-                termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+                    termios.tcsetattr(fd, termios.TCSANOW, old_settings)
             except termios.error:
                 pass
 
