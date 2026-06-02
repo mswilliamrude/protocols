@@ -212,11 +212,22 @@ def main():
                         # Write data before the signature to terminal
                         if idx > 0:
                             os.write(stdout_fd, data[:idx])
+                            
+                        # Reconstruct zmodem_buffer from snoop_buffer to ensure we don't lose the start
+                        # of the signature if it was split across os.read chunks.
+                        sig_str = b'**\x18B01' if (is_upload or b'**\x18B01' in snoop_buffer) else b'**\x18B00'
+                        sig_idx = snoop_buffer.find(sig_str)
+                        if sig_idx == -1: 
+                            sig_idx = snoop_buffer.find(b'**\x18B00')
+                            
+                        if sig_idx >= 3 and snoop_buffer[sig_idx-3:sig_idx] == b'rz\r':
+                            sig_idx -= 3
+                            
+                        zmodem_buffer = snoop_buffer[max(0, sig_idx):]
                         
-                        zmodem_buffer = data[idx:]
-                        if is_upload and req_str in data:
+                        if is_upload and req_str in snoop_buffer:
                             # Skip the request string and get to the **\x18B01
-                            zmodem_buffer = data[data.find(b'**\x18B01'):]
+                            zmodem_buffer = snoop_buffer[snoop_buffer.find(b'**\x18B01'):]
                             
                         def wrapper_getc(size, timeout=1):
                             nonlocal zmodem_buffer
