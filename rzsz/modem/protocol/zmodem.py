@@ -514,18 +514,18 @@ class ZMODEM(Modem):
         for x in range(0, 5):
             char = self._recv_hex(timeout)
             if char is const.TIMEOUT:
-                return const.TIMEOUT
+                return 0, False
             mine = self.calc_crc16(chr(char), mine)
             header.append(char)
 
         # Read their crc
         char = self._recv_hex(timeout)
         if char is const.TIMEOUT:
-            return const.TIMEOUT
+            return 0, False
         rcrc = char << 0x08
         char = self._recv_hex(timeout)
         if char is const.TIMEOUT:
-            return const.TIMEOUT
+            return 0, False
         rcrc |= char
 
         log.debug('My CRC = %04x, theirs = %04x' % (mine, rcrc))
