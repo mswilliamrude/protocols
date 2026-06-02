@@ -218,16 +218,12 @@ def main():
                     elif zrqinit_sig in snoop_buffer or zrinit_sig in snoop_buffer:
                         if zrqinit_sig in data:
                             idx = data.find(zrqinit_sig)
-                            # Truncate snoop buffer up to idx
-                            snoop_buffer = snoop_buffer[:snoop_buffer.find(zrqinit_sig) + len(zrqinit_sig)]
                             if args.debug:
-                                logging.debug(f"Found **\\x{modem.const.ZDLE:02x}B00 at index {idx}")
+                                logging.debug(f"Found **\\x{ZDLE:02x}B00 at index {idx}")
                         elif zrinit_sig in data:
                             idx = data.find(zrinit_sig)
-                            # Truncate snoop buffer up to idx
-                            snoop_buffer = snoop_buffer[:snoop_buffer.find(zrinit_sig) + len(zrinit_sig)]
                             if args.debug:
-                                logging.debug(f"Found **\\x{modem.const.ZDLE:02x}B01 at index {idx}")
+                                logging.debug(f"Found **\\x{ZDLE:02x}B01 at index {idx}")
                         else:
                             idx = 0
                             
