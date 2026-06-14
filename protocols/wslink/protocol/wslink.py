@@ -1,5 +1,6 @@
 import asyncio
 import os
+import struct
 import time
 import logging
 import traceback
