@@ -378,9 +378,22 @@ class WSLinkSession:
             if self.current_fd is None:
                 log.warning("Received VERIFY_BLOCK but no file is currently open for sending. Ignoring.")
                 return
+            if len(payload) < ResumeVerifyPacket.HEADER_SIZE:
+                log.warning("VERIFY_BLOCK payload too short for header. Ignoring.")
+                return
             v_header = ResumeVerifyPacket.unpack_header(payload)
             base_block = v_header['base_block']
             count = v_header['count']
+            
+            # Cap count to prevent unbounded CPU/disk usage from crafted packets
+            count = min(count, self.verify_limit)
+            
+            # Validate payload has enough CRC data
+            expected_payload_size = ResumeVerifyPacket.HEADER_SIZE + count * 4
+            if len(payload) < expected_payload_size:
+                log.warning(f"VERIFY_BLOCK payload too short: need {expected_payload_size}, got {len(payload)}. Ignoring.")
+                return
+            
             log.info(f"Peer requested VERIFY for {count} blocks starting at {base_block}.")
             
             self.current_fd.seek(base_block * self.block_size)
