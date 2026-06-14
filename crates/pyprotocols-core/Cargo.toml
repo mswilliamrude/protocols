@@ -1,0 +1,30 @@
+[package]
+name = "pyprotocols-core"
+version = "1.0.0"
+edition = "2021"
+description = "High-performance file transfer protocol core — WSLink, HSLink, ZMODEM framing and CRC"
+license = "MIT"
+authors = ["mswilliamrude"]
+
+[lib]
+name = "pyprotocols_core"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+async = ["tokio"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+crc32fast = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "io-util"], optional = true }
+
+[build-system]
+requires = ["maturin>=1.5"]
+build-backend = "maturin"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
