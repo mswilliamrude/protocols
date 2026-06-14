@@ -231,16 +231,20 @@ class WSLinkSession:
             if seq['batch'] == self.batch_index:
                 ack_block = seq['block']
                 
-                # RTT measurement
+                # RTT measurement — only accurate for the specific block ACKed
                 if ack_block in self.block_send_times:
                     rtt = time.time() - self.block_send_times[ack_block]
                     self._update_rtt(rtt)
                 
-                cleared = [k for k in self.unacked_blocks.keys() if k <= ack_block]
-                for k in cleared:
-                    del self.unacked_blocks[k]
-                    if k in self.block_send_times:
-                        del self.block_send_times[k]
+                # Selective ACK: only clear the specific block acknowledged.
+                # The receiver sends per-block ACKs, so each ACK confirms
+                # exactly one block. Cumulative clearing is UNSAFE because
+                # if block N arrives but block N-1 was lost/reordered, clearing
+                # all blocks <= N removes N-1 from retransmit tracking forever.
+                if ack_block in self.unacked_blocks:
+                    del self.unacked_blocks[ack_block]
+                if ack_block in self.block_send_times:
+                    del self.block_send_times[ack_block]
 
         elif pkt_type == PACK_NAK_BLOCK:
             seq = SequencePacket.unpack(payload)
