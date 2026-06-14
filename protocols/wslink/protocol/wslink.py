@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import os
 import struct
 import time
@@ -45,7 +46,7 @@ class WSLinkSession:
         self.verify_limit = kwargs.get('verify_limit', 100)
         self.rtt_history_size = kwargs.get('rtt_history_size', 20)
         self.block_send_times = {}
-        self.rtt_history = []
+        self.rtt_history = collections.deque(maxlen=self.rtt_history_size)
         
         self.on_chat_received = None
         self._sent_z = False
@@ -119,32 +120,6 @@ class WSLinkSession:
             except asyncio.TimeoutError:
                 pass  # Timeout — check for retransmits
 
-    def _open_next_file(self):
-        if not self.files_to_send:
-            return
-            
-        filepath = self.files_to_send.pop(0)
-        st = os.stat(filepath)
-        size = st.st_size
-        blocks = (size + self.block_size - 1) // self.block_size
-        
-        log.info(f"Opening file: {filepath} ({size} bytes)")
-        
-        filename = os.path.basename(filepath)
-        header = FileHeaderPacket.pack(
-            name=filename,
-            size=size,
-            blocks=blocks,
-            block_size=self.block_size,
-            time_float=st.st_mtime,
-            batch=self.batch_index
-        )
-        
-        # send packet asynchronously? We are inside a synchronous context here,
-        # but _open_next_file is called from _pump_sender which is async.
-        # Let's change _open_next_file to async.
-        pass
-
     async def _open_next_file_async(self):
         if not self.files_to_send:
             return
@@ -175,7 +150,7 @@ class WSLinkSession:
         self.block_send_times.clear()
 
     async def _pump_sender(self):
-        if getattr(self, '_sent_z', False):
+        if self._sent_z:
             return
             
         if not self.current_file:
@@ -202,6 +177,7 @@ class WSLinkSession:
                 
         # Fill Window — buffer all data frames, flush once at the end
         sent_any = False
+        fill_time = time.time()  # Single timestamp for entire burst
         while len(self.unacked_blocks) < self.window_size and self.next_block_num < self.total_blocks:
             chunk = self.current_fd.read(self.block_size)
             if not chunk:
@@ -211,7 +187,7 @@ class WSLinkSession:
             payload = seq_bytes + chunk
             
             self.unacked_blocks[self.next_block_num] = payload
-            self.block_send_times[self.next_block_num] = time.time()
+            self.block_send_times[self.next_block_num] = fill_time
             
             await self.framer.send_packet(PACK_DATA_BLOCK, payload)
             self.next_block_num += 1
@@ -230,9 +206,7 @@ class WSLinkSession:
             self.batch_index += 1
 
     def _update_rtt(self, rtt: float):
-        self.rtt_history.append(rtt)
-        if len(self.rtt_history) > self.rtt_history_size:
-            self.rtt_history.pop(0)
+        self.rtt_history.append(rtt)  # deque(maxlen=N) auto-evicts oldest
             
         avg_rtt = sum(self.rtt_history) / len(self.rtt_history)
         
