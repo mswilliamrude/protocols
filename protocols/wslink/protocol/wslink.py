@@ -255,10 +255,23 @@ class WSLinkSession:
                 
         elif pkt_type == PACK_OPEN_FILE:
             header = FileHeaderPacket.unpack(payload)
-            filename = header['name']
-            log.info(f"Peer requested to open file: {filename} ({header['size']} bytes)")
+            raw_name = header['name']
             
-            filepath = os.path.join(self.recv_dir, filename)
+            # Security: strip directory components to prevent path traversal
+            filename = os.path.basename(raw_name)
+            if not filename or filename.startswith('.'):
+                log.error(f"Rejected unsafe filename: {raw_name!r}")
+                await self.framer.send_packet(PACK_SKIP_FILE, b"")
+                return
+            
+            filepath = os.path.realpath(os.path.join(self.recv_dir, filename))
+            recv_dir_real = os.path.realpath(self.recv_dir)
+            if not filepath.startswith(recv_dir_real + os.sep) and filepath != recv_dir_real:
+                log.error(f"Path traversal attempt blocked: {raw_name!r} -> {filepath}")
+                await self.framer.send_packet(PACK_SKIP_FILE, b"")
+                return
+            
+            log.info(f"Peer requested to open file: {filename} ({header['size']} bytes)")
             self.recv_file = filepath
             self.recv_batch_index = header['batch']
             self.recv_expected_block = 0
