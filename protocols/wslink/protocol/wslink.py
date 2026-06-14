@@ -150,7 +150,7 @@ class WSLinkSession:
             batch=self.batch_index
         )
         
-        await self.framer.send_packet(PACK_OPEN_FILE, header)
+        await self.framer.send_packet_immediate(PACK_OPEN_FILE, header)
         self.current_file = filepath
         self.current_fd = open(filepath, 'rb')
         self.total_blocks = blocks
