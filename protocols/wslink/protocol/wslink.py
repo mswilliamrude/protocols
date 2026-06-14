@@ -375,6 +375,9 @@ class WSLinkSession:
             self._send_event.set()  # Wake sender — file skipped, move to next
             
         elif pkt_type == PACK_VERIFY_BLOCK:
+            if self.current_fd is None:
+                log.warning("Received VERIFY_BLOCK but no file is currently open for sending. Ignoring.")
+                return
             v_header = ResumeVerifyPacket.unpack_header(payload)
             base_block = v_header['base_block']
             count = v_header['count']
