@@ -174,8 +174,8 @@ class WSLinkSession:
             
         if not self.current_file:
             if not self.files_to_send:
-                if self.batch_index > 0:
-                    log.info("All files transmitted.")
+                if not self._sent_z:
+                    log.info("All files transmitted (or none to send). Signaling TRANSMIT_DONE (Z).")
                     await self.framer.send_packet_immediate(PACK_TRANSMIT_DONE, b"")
                     self._sent_z = True
                 return
