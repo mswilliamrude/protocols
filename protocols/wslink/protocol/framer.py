@@ -1,5 +1,6 @@
 import struct
 import zlib
+import asyncio
 import logging
 
 log = logging.getLogger(__name__)
@@ -13,9 +14,14 @@ class WSLinkFramer:
     Modern Length-Prefixed Clean Pipe Framer.
     Format: [4-byte length L] [1-byte type] [payload] [4-byte CRC32]
     where L = length of (type + payload + CRC32).
+    
+    Supports write coalescing: multiple send_packet() calls buffer
+    internally and flush as a single write() call via flush().
     """
     def __init__(self, transport):
         self.transport = transport
+        self._write_buf = bytearray()
+        self._flush_lock = asyncio.Lock()
         
     async def read_packet(self):
         len_bytes = await self.transport.read_exactly(4)
@@ -42,15 +48,35 @@ class WSLinkFramer:
         actual_crc = zlib.crc32(packet_data[:-4]) & 0xFFFFFFFF
         if actual_crc != expected_crc:
             log.warning(f"CRC Mismatch! Expected {expected_crc:08x}, got {actual_crc:08x}")
-            # Return a junk tuple so the loop continues instead of interpreting as EOF.
             return b'?', b''
             
         return pkt_type, payload
         
-    async def send_packet(self, pkt_type: bytes, payload: bytes):
+    def _build_frame(self, pkt_type: bytes, payload: bytes) -> bytes:
+        """Build a complete wire frame (no I/O)."""
         data = pkt_type + payload
         crc = zlib.crc32(data) & 0xFFFFFFFF
-        # Length includes type (1) + payload + CRC (4)
         length = len(data) + 4
-        frame = struct.pack('<I', length) + data + struct.pack('<I', crc)
+        return struct.pack('<I', length) + data + struct.pack('<I', crc)
+
+    async def send_packet(self, pkt_type: bytes, payload: bytes):
+        """Buffer a frame for sending. Call flush() to write all buffered frames."""
+        frame = self._build_frame(pkt_type, payload)
+        self._write_buf.extend(frame)
+    
+    async def send_packet_immediate(self, pkt_type: bytes, payload: bytes):
+        """Build and send a frame immediately (bypasses buffer). Use for
+        control packets (ACK, NAK, handshake) that need low latency."""
+        frame = self._build_frame(pkt_type, payload)
         await self.transport.write(frame)
+
+    async def flush(self):
+        """Flush all buffered frames as a single write. Thread-safe."""
+        if not self._write_buf:
+            return
+        async with self._flush_lock:
+            if not self._write_buf:
+                return
+            data = bytes(self._write_buf)
+            self._write_buf.clear()
+            await self.transport.write(data)
