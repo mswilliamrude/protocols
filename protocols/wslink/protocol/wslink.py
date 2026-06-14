@@ -52,13 +52,13 @@ class WSLinkSession:
         self.files_to_send.extend(file_paths)
         
     async def send_chat(self, message: bytes):
-        await self.framer.send_packet(PACK_CHAT_BLOCK, message)
+        await self.framer.send_packet_immediate(PACK_CHAT_BLOCK, message)
         
     async def loop(self):
         # Initial Handshake
         log.debug("Sending Handshake (R and Q)...")
-        await self.framer.send_packet(PACK_READY, b"")
-        await self.framer.send_packet(PACK_READY_RECV, b"")
+        await self.framer.send_packet_immediate(PACK_READY, b"")
+        await self.framer.send_packet_immediate(PACK_READY_RECV, b"")
         
         recv_task = asyncio.create_task(self._recv_loop())
         send_task = asyncio.create_task(self._send_loop())
@@ -159,7 +159,7 @@ class WSLinkSession:
             if not self.files_to_send:
                 if self.batch_index > 0:
                     log.info("All files transmitted.")
-                    await self.framer.send_packet(PACK_TRANSMIT_DONE, b"")
+                    await self.framer.send_packet_immediate(PACK_TRANSMIT_DONE, b"")
                     self._sent_z = True
                 return
             await self._open_next_file_async()
@@ -174,10 +174,11 @@ class WSLinkSession:
                 self.window_size = max(1, self.window_size // 2) # Halve window on timeout
                 
                 stored_payload = self.unacked_blocks[oldest_block]
-                await self.framer.send_packet(PACK_DATA_BLOCK, stored_payload)
+                await self.framer.send_packet_immediate(PACK_DATA_BLOCK, stored_payload)
                 self.block_send_times[oldest_block] = current_time # Reset timer
                 
-        # Fill Window
+        # Fill Window — buffer all data frames, flush once at the end
+        sent_any = False
         while len(self.unacked_blocks) < self.window_size and self.next_block_num < self.total_blocks:
             chunk = self.current_fd.read(self.block_size)
             if not chunk:
@@ -191,11 +192,16 @@ class WSLinkSession:
             
             await self.framer.send_packet(PACK_DATA_BLOCK, payload)
             self.next_block_num += 1
+            sent_any = True
+
+        # Single flush for entire window fill
+        if sent_any:
+            await self.framer.flush()
 
         # EOF Handle
         if self.next_block_num >= self.total_blocks and not self.unacked_blocks:
             log.info(f"File {self.current_file} successfully transferred.")
-            await self.framer.send_packet(PACK_CLOSE_FILE, b"")
+            await self.framer.send_packet_immediate(PACK_CLOSE_FILE, b"")
             self.current_fd.close()
             self.current_file = None
             self.batch_index += 1
@@ -250,7 +256,7 @@ class WSLinkSession:
                     log.warning(f"Received NAK for block {nak_block}. Resending.")
                     self.window_size = max(1, self.window_size // 2) # Halve on drop
                     stored_payload = self.unacked_blocks[nak_block]
-                    await self.framer.send_packet(PACK_DATA_BLOCK, stored_payload)
+                    await self.framer.send_packet_immediate(PACK_DATA_BLOCK, stored_payload)
                     self.block_send_times[nak_block] = time.time()
                 
         elif pkt_type == PACK_OPEN_FILE:
@@ -269,7 +275,7 @@ class WSLinkSession:
                 st = os.stat(filepath)
                 if st.st_size == header['size']:
                     log.info(f"File {filename} exists and matches size. Sending SKIP (K).")
-                    await self.framer.send_packet(PACK_SKIP_FILE, b"")
+                    await self.framer.send_packet_immediate(PACK_SKIP_FILE, b"")
                     return
                 elif st.st_size < header['size']:
                     log.info(f"File {filename} partially exists. Hashing blocks to send VERIFY (V).")
@@ -286,7 +292,7 @@ class WSLinkSession:
                         
                         if count > 0:
                             v_payload = ResumeVerifyPacket.pack_header(0, count) + crcs
-                            await self.framer.send_packet(PACK_VERIFY_BLOCK, v_payload)
+                            await self.framer.send_packet_immediate(PACK_VERIFY_BLOCK, v_payload)
                             self.recv_expected_block = count
                             self.recv_fd = open(filepath, 'ab')
                             return
@@ -305,15 +311,15 @@ class WSLinkSession:
                     self.recv_expected_block += 1
                     
                     ack_payload = SequencePacket.pack(seq['batch'], seq['block'])
-                    await self.framer.send_packet(PACK_ACK_BLOCK, ack_payload)
+                    await self.framer.send_packet_immediate(PACK_ACK_BLOCK, ack_payload)
                 elif seq['block'] > self.recv_expected_block:
                     log.warning(f"Out of order block {seq['block']} received, expecting {self.recv_expected_block}. Sending NAK.")
                     nak_payload = SequencePacket.pack(seq['batch'], self.recv_expected_block)
-                    await self.framer.send_packet(PACK_NAK_BLOCK, nak_payload)
+                    await self.framer.send_packet_immediate(PACK_NAK_BLOCK, nak_payload)
                 else:
                     # Duplicate
                     ack_payload = SequencePacket.pack(seq['batch'], seq['block'])
-                    await self.framer.send_packet(PACK_ACK_BLOCK, ack_payload)
+                    await self.framer.send_packet_immediate(PACK_ACK_BLOCK, ack_payload)
                     
         elif pkt_type == PACK_SKIP_FILE:
             log.info(f"Peer requested SKIP for file: {self.current_file}")
@@ -347,7 +353,7 @@ class WSLinkSession:
             self.block_send_times.clear()
             
             seq_payload = SequencePacket.pack(self.batch_index, self.next_block_num)
-            await self.framer.send_packet(PACK_SEEK_BLOCK, seq_payload)
+            await self.framer.send_packet_immediate(PACK_SEEK_BLOCK, seq_payload)
             
         elif pkt_type == PACK_SEEK_BLOCK:
             seq = SequencePacket.unpack(payload)
