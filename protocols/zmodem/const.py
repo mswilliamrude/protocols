@@ -289,7 +289,7 @@ NAK = b'\x15'
 CAN = b'\x18'
 CRC = b'\x43'
 
-TIMEOUT = None
+TIMEOUT = object()  # Unique sentinel — never use -1 or None
 ZPAD = 0x2a
 ZDLE = 0x18
 ZDLEE = 0x58
@@ -365,7 +365,7 @@ ZP0, ZP1, ZP2, ZP3 = range(1, 5)
 # ZMODEM Frame contents
 ENDOFFRAME = 2
 FRAMEOK = 1
-TIMEOUT = -1      # Rx routine did not receive a character within timeout
+# TIMEOUT sentinel is defined above (unique object()) — do NOT redefine here
 INVHDR = -2       # Invalid header received; but within timeout
 INVDATA = -3      # Invalid data subpacket received
 ZDLEESC = 0x8000  # One of ZCRCE/ZCRCG/ZCRCQ/ZCRCW was ZDLE escaped

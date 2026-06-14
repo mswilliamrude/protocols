@@ -158,13 +158,16 @@ class HSLinkSession:
         """
         Routes the unescaped, CRC-verified packet payload to the state machine logic.
         """
+        # FIX B — Chat is always allowed (out-of-band M2M channel)
         if pkt_type == PACK_CHAT_BLOCK:
             if self.on_chat_received:
                 self.on_chat_received(payload)
             else:
                 log.info(f"[CHAT/M2M] {payload!r}")
-                
-        elif pkt_type == PACK_READY or pkt_type == PACK_READY_RECV:
+            return
+
+        # FIX B — Handshake packets are always allowed
+        if pkt_type in (PACK_READY, PACK_READY_RECV):
             if self.state == "INIT":
                 self.state = "TRANSFERRING"
                 log.info("Handshake sync complete. Connection established.")
@@ -176,8 +179,20 @@ class HSLinkSession:
                 if not self.files_to_send:
                     log.info("Send queue empty, sending PACK_TRANSMIT_DONE (Z) immediately.")
                     self.framer.send_packet(PACK_TRANSMIT_DONE, b"")
-                
-        elif pkt_type == PACK_ACK_BLOCK:
+            return
+
+        # FIX B — STATE MACHINE GUARD: reject non-handshake packets before transfer state
+        if self.state != "TRANSFERRING":
+            log.warning(f"Rejected packet {pkt_type!r} in state {self.state}")
+            return
+
+        # --- All handlers below require state == TRANSFERRING ---
+
+        if pkt_type == PACK_ACK_BLOCK:
+            # FIX C — Payload length validation
+            if len(payload) < SequencePacket.SIZE:
+                log.warning("Payload too short for SequencePacket (ACK)")
+                return
             seq = SequencePacket.unpack(payload)
             if seq['batch'] == self.batch_index:
                 ack_block = seq['block']
@@ -188,6 +203,10 @@ class HSLinkSession:
                 self.last_arq_time = time.time()
 
         elif pkt_type == PACK_NAK_BLOCK:
+            # FIX C — Payload length validation
+            if len(payload) < SequencePacket.SIZE:
+                log.warning("Payload too short for SequencePacket (NAK)")
+                return
             seq = SequencePacket.unpack(payload)
             if seq['batch'] == self.batch_index:
                 nak_block = seq['block']
@@ -198,11 +217,27 @@ class HSLinkSession:
                     self.framer.send_packet(PACK_DATA_BLOCK_SMD, stored_payload)
                 
         elif pkt_type == PACK_OPEN_FILE:
+            # FIX C — Payload length validation
+            if len(payload) < FileHeaderPacket.SIZE:
+                log.warning("Payload too short for FileHeaderPacket")
+                return
             header = FileHeaderPacket.unpack(payload)
-            filename = header['name'].decode('utf-8', 'ignore')
-            log.info(f"Peer requested to open file: {filename} ({header['size']} bytes)")
+            raw_name = header['name'].decode('utf-8', 'ignore')
+            log.info(f"Peer requested to open file: {raw_name} ({header['size']} bytes)")
             
-            filepath = os.path.join(self.recv_dir, filename)
+            # FIX A — PATH TRAVERSAL PREVENTION
+            filename = os.path.basename(raw_name)
+            if not filename or filename.startswith('.'):
+                log.error(f"Rejected unsafe filename: {raw_name!r}")
+                self.framer.send_packet(PACK_SKIP_FILE, b"")
+                return
+            filepath = os.path.realpath(os.path.join(self.recv_dir, filename))
+            recv_dir_real = os.path.realpath(self.recv_dir)
+            if not filepath.startswith(recv_dir_real + os.sep) and filepath != recv_dir_real:
+                log.error(f"Path traversal blocked: {raw_name!r}")
+                self.framer.send_packet(PACK_SKIP_FILE, b"")
+                return
+
             self.recv_file = filepath
             self.recv_batch_index = header['batch']
             self.recv_expected_block = 0
@@ -242,6 +277,11 @@ class HSLinkSession:
             # Type D: Sequence + Mapping + Data
             seq_size = SequencePacket.SIZE
             map_size = ControlMapping.SIZE
+            
+            # FIX C — Payload length validation
+            if len(payload) < seq_size + map_size:
+                log.warning("Payload too short for DATA_BLOCK_SMD (Seq+Map)")
+                return
             
             seq = SequencePacket.unpack(payload[:seq_size])
             chunk = payload[seq_size + map_size:]
@@ -283,6 +323,10 @@ class HSLinkSession:
         elif pkt_type == PACK_EXTNAK_BLOCK:
             # Sub-Block NAKs (M Packets)
             # Over TCP, we treat this exactly like a full-block NAK for reliability.
+            # FIX C — Payload length validation
+            if len(payload) < ExtNakPacket.HEADER_SIZE:
+                log.warning("Payload too short for ExtNakPacket")
+                return
             header = ExtNakPacket.unpack_header(payload)
             if header['batch'] == self.batch_index:
                 nak_block = header['block']
@@ -298,6 +342,10 @@ class HSLinkSession:
             
         elif pkt_type == PACK_VERIFY_BLOCK:
             # Resume verification (V)
+            # FIX C — Payload length validation
+            if len(payload) < ResumeVerifyPacket.HEADER_SIZE:
+                log.warning("Payload too short for ResumeVerifyPacket")
+                return
             v_header = ResumeVerifyPacket.unpack_header(payload)
             base_block = v_header['base_block']
             count = v_header['count']
@@ -327,6 +375,10 @@ class HSLinkSession:
             self.framer.send_packet(PACK_SEEK_BLOCK, seq_payload)
             
         elif pkt_type == PACK_SEEK_BLOCK:
+            # FIX C — Payload length validation
+            if len(payload) < SequencePacket.SIZE:
+                log.warning("Payload too short for SequencePacket (SEEK)")
+                return
             seq = SequencePacket.unpack(payload)
             if seq['batch'] == self.recv_batch_index:
                 log.info(f"Sender seeking to block {seq['block']}")
@@ -359,12 +411,27 @@ class HSLinkSession:
         """
         Blocks and runs the session until carrier is lost or session naturally completes.
         """
-        while self.transport.idle(timeout=0.01):
-            self.step()
-            
-            # If we've successfully finished our side of the send, sleep briefly to flush and exit.
-            if self.state == "DONE":
-                time.sleep(0.5)
-                # Ensure the transport knows we're done so it closes down
-                self.transport.carrier_lost = True
-                break
+        try:
+            while self.transport.idle(timeout=0.01):
+                self.step()
+                
+                # If we've successfully finished our side of the send, sleep briefly to flush and exit.
+                if self.state == "DONE":
+                    time.sleep(0.5)
+                    # Ensure the transport knows we're done so it closes down
+                    self.transport.carrier_lost = True
+                    break
+        finally:
+            # FIX D — FILE DESCRIPTOR CLEANUP on session exit
+            if self.recv_fd:
+                try:
+                    self.recv_fd.close()
+                except Exception:
+                    pass
+                self.recv_fd = None
+            if self.current_fd:
+                try:
+                    self.current_fd.close()
+                except Exception:
+                    pass
+                self.current_fd = None

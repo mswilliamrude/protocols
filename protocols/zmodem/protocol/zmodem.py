@@ -325,6 +325,7 @@ class ZMODEM(Modem):
             return False, data
 
     def _recv_16_data(self, timeout):
+        MAX_SUBPACKET_SIZE = 8192  # ZMODEM spec: typical max is 1024, generous cap at 8KB
         char = 0
         data = bytearray()
         mine = 0
@@ -337,6 +338,9 @@ class ZMODEM(Modem):
             elif char < 0x100:
                 mine = self.calc_crc16(bytes([char & 0xff]), mine)
                 data.append(char)
+                if len(data) > MAX_SUBPACKET_SIZE:
+                    log.error("Subpacket exceeds maximum size — aborting reception")
+                    return const.TIMEOUT, b''
 
         # Calculate our crc, unescape the sub_frame_kind
         sub_frame_kind = char ^ const.ZDLEESC
@@ -354,6 +358,7 @@ class ZMODEM(Modem):
             return sub_frame_kind, bytes(data)
 
     def _recv_32_data(self, timeout):
+        MAX_SUBPACKET_SIZE = 8192  # ZMODEM spec: typical max is 1024, generous cap at 8KB
         mine = 0
         data = bytearray()
         while True:
@@ -363,6 +368,9 @@ class ZMODEM(Modem):
             elif char < 0x100:
                 mine = self.calc_crc32(bytes([char & 0xff]), mine)
                 data.append(char)
+                if len(data) > MAX_SUBPACKET_SIZE:
+                    log.error("Subpacket exceeds maximum size — aborting reception")
+                    return const.TIMEOUT, b''
             else:
                 break
 
@@ -591,7 +599,17 @@ class ZMODEM(Modem):
         # We got the file name
         part = data.split(b'\x00')
         filename = part[0].decode('utf-8', 'replace')
-        filepath = os.path.join(basedir, os.path.basename(filename))
+        
+        # Path traversal hardening: sanitize filename
+        filename = os.path.basename(filename.replace('\\', '/'))  # handle Windows-style paths
+        if not filename or filename.startswith('.'):
+            log.error(f"Rejected unsafe filename: {filename!r}")
+            return False
+        filepath = os.path.realpath(os.path.join(basedir, filename))
+        basedir_real = os.path.realpath(basedir)
+        if not filepath.startswith(basedir_real + os.sep) and filepath != basedir_real:
+            log.error(f"Path traversal blocked: {filename!r}")
+            return False
         
         file_size_on_disk = 0
         if os.path.exists(filepath) and not force_overwrite:
@@ -663,6 +681,15 @@ class ZMODEM(Modem):
         log.info('Receiving file "%s" done at %.02f bps' % (filename, speed))
 
         # Truncate to exact size specified in ZFILE header to strip any trailing ZMODEM frame padding
+        MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024  # 10GB cap
+        if size > MAX_FILE_SIZE:
+            log.error(f"Claimed file size {size} exceeds maximum. Rejecting.")
+            fp.close()
+            return False
+        if size < 0:
+            log.error(f"Negative file size {size}. Rejecting.")
+            fp.close()
+            return False
         fp.truncate(size)
         fp.close()
         
@@ -725,7 +752,7 @@ class ZMODEM(Modem):
         header.append(pos & 0xff)
         header.append((pos >> 0x08) & 0xff)
         header.append((pos >> 0x10) & 0xff)
-        header.append((pos >> 0x20) & 0xff)
+        header.append((pos >> 0x18) & 0xff)
         self._send_hex_header(header, timeout)
 
     def _send_hex(self, char, timeout):
