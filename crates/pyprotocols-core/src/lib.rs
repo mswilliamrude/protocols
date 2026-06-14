@@ -43,5 +43,14 @@ fn pyprotocols_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // WSLink constants
     protocols::wslink::register_constants(m)?;
 
+    // HSLink framer
+    m.add_class::<protocols::hslink::HSLinkFramer>()?;
+
+    // HSLink constants
+    protocols::hslink::register_constants(m)?;
+
+    // ZMODEM codec
+    protocols::zmodem::register(m)?;
+
     Ok(())
 }
