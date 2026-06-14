@@ -10,6 +10,8 @@ class HSLinkFramer:
     Consumes raw bytes from a Transport, unescapes DLE chars, verifies CRC, 
     and yields clean (Packet Type, Payload) tuples.
     """
+    MAX_BUFFER_SIZE = 1 * 1024 * 1024  # 1MB — FIX E
+
     def __init__(self, transport):
         self.transport = transport
         self.crc_size = DEF_CRC_SIZE # Default to 3 (24-bit)
@@ -61,6 +63,15 @@ class HSLinkFramer:
         new_data = self.transport.read()
         if new_data:
             self._buffer.extend(new_data)
+
+        # FIX E — BUFFER SIZE CAP: prevent unbounded memory consumption
+        if len(self._buffer) > self.MAX_BUFFER_SIZE:
+            log.error("Buffer overflow — peer sending unbounded data. Resetting.")
+            self._buffer.clear()
+            self._in_packet = False
+            self._escaped = False
+            self._current_packet = bytearray()
+            return []
 
         packets = []
         i = 0
