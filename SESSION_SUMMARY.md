@@ -34,3 +34,24 @@
    - `git push -u origin feature/wslink`
 3. **Integration**:
    - Hook `protocols.wslink.transport.AsyncStreamTransport` up to a FastAPI WebSocket endpoint or `asyncssh` server to test real-world tunneling!
+---
+
+## WSLink Bug Fix Required (2026-06-14)
+
+**Bug:** TRANSMIT_DONE (Z) sent when `batch_index == 0` (no files transferred) kills
+the peer's WSLink session. Chat channel dies because the receiver transitions to DONE
+on receiving Z, even though no file transfer occurred.
+
+**Root cause:** Security patch changed sender from `if batch_index > 0: send Z` to
+`if not _sent_z: send Z` (unconditional). This breaks chat-only sessions (MCP router).
+
+**Fix needed in protocols/ repo:**
+1. `protocols/wslink/protocol/wslink.py` — sender: only send Z when `batch_index > 0`
+2. `protocols/wslink/protocol/wslink.py` — receiver: don't transition to DONE on Z
+   (or add `keep_alive` parameter that prevents DONE transition)
+
+**Fix already applied in:** `Skill_Multiagent/unimind/clients/common/wslink/` and
+`Skill_Multiagent/unimind/mcp/wslink/` (commit ee22bea)
+
+**Also relevant for Rust rewrite:** The Rust WSLink implementation must NOT send Z
+in chat-only mode. Add a `ChatMode` vs `FileTransferMode` enum to make this explicit.

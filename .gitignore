@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 hsaio.py
 dgdg.py
+
+# Rust build artifacts
+crates/*/target/

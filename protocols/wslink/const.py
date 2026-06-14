@@ -6,10 +6,12 @@ PACK_CHAT_BLOCK = b'H'
 PACK_SKIP_FILE = b'K'
 PACK_NAK_BLOCK = b'N'   # Replaces M as well
 PACK_OPEN_FILE = b'O'
+PACK_PING = b'P'        # Heartbeat ping (keepalive)
 PACK_READY_RECV = b'Q'
 PACK_READY = b'R'
 PACK_SEEK_BLOCK = b'S'
 PACK_VERIFY_BLOCK = b'V'
+PACK_PONG = b'W'        # Heartbeat pong (response to ping)
 PACK_TRANSMIT_DONE = b'Z'
 
 MAX_BLOCK_SIZE = 4096

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "unimind": {
+      "type": "local",
+      "command": [
+        "/home/azureuser/git/Skill_Multiagent/unimind/clients/common/.venv/bin/python3",
+        "/home/azureuser/git/Skill_Multiagent/unimind/clients/common/router.py",
+        "--client-id", "opencode-protocols",
+        "--server", "ws://10.0.10.6:8080/ws"
+      ],
+      "enabled": true,
+      "environment": {
+        "UNIMIND_WS_TOKEN": "dev-token-changeme",
+        "PYTHONPATH": "/home/azureuser/git/Skill_Multiagent/unimind/clients/common"
+      }
+    },
+    "mempalace": {
+      "type": "local",
+      "command": [
+        "/home/azureuser/git/mempalace/.venv/bin/python3",
+        "-m",
+        "mempalace.mcp_server"
+      ],
+      "enabled": true,
+      "environment": {
+        "MEMPALACE_PALACE_PATH": "/home/azureuser/.mempalace",
+        "PYTHONPATH": "/home/azureuser/git/mempalace"
+      }
+    }
+  }
+}

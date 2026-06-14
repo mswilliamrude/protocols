@@ -42,7 +42,8 @@ class WSLinkSession:
         self.window_size = kwargs.get('initial_window', 16)
         self.max_window_size = kwargs.get('max_window', 256)
         self.arq_timeout = kwargs.get('arq_timeout', 2.0)
-        self.idle_timeout = kwargs.get('idle_timeout', 60.0)
+        self.idle_timeout = kwargs.get('idle_timeout', 60.0)   # 3 missed heartbeats = dead
+        self.heartbeat_interval = kwargs.get('heartbeat_interval', 20.0)  # Send ping every 20s
         self.verify_limit = kwargs.get('verify_limit', 100)
         self.rtt_history_size = kwargs.get('rtt_history_size', 20)
         self.block_send_times = {}
@@ -66,19 +67,40 @@ class WSLinkSession:
         
         recv_task = asyncio.create_task(self._recv_loop())
         send_task = asyncio.create_task(self._send_loop())
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
         try:
-            await asyncio.gather(recv_task, send_task)
+            await asyncio.gather(recv_task, send_task, heartbeat_task)
         except Exception as e:
             log.error(f"WSLinkSession loop error: {e}\n{traceback.format_exc()}")
             self.state = "DONE"
+
+    async def _heartbeat_loop(self):
+        """Send periodic PING to keep the connection alive and detect dead peers."""
+        while self.state != "DONE":
+            await asyncio.sleep(self.heartbeat_interval)
+            if self.state == "DONE":
+                break
+            try:
+                # Send PING with timestamp for RTT measurement
+                payload = struct.pack('<d', time.time())
+                await self.framer.send_packet_immediate(PACK_PING, payload)
+                log.debug("Heartbeat PING sent")
+            except Exception as e:
+                log.warning(f"Heartbeat send failed: {e}")
+                self.state = "DONE"
+                break
         
     async def _recv_loop(self):
         while self.state != "DONE":
             try:
-                packet = await asyncio.wait_for(
-                    self.framer.read_packet(), timeout=self.idle_timeout
-                )
+                if self.idle_timeout and self.idle_timeout > 0:
+                    packet = await asyncio.wait_for(
+                        self.framer.read_packet(), timeout=self.idle_timeout
+                    )
+                else:
+                    # No timeout — wait indefinitely (MCP chat sessions rely on heartbeat)
+                    packet = await self.framer.read_packet()
             except asyncio.TimeoutError:
                 log.warning(f"Idle timeout — no data received in {self.idle_timeout}s. Closing session.")
                 self.state = "DONE"
@@ -156,8 +178,12 @@ class WSLinkSession:
         if not self.current_file:
             if not self.files_to_send:
                 if not self._sent_z:
-                    log.info("All files transmitted (or none to send). Signaling TRANSMIT_DONE (Z).")
-                    await self.framer.send_packet_immediate(PACK_TRANSMIT_DONE, b"")
+                    # Only send TRANSMIT_DONE if we actually transferred files.
+                    # Sending Z with no files (batch_index=0) causes the peer's
+                    # session to exit, killing the chat channel used for MCP traffic.
+                    if self.batch_index > 0:
+                        log.info("All files transmitted. Signaling TRANSMIT_DONE (Z).")
+                        await self.framer.send_packet_immediate(PACK_TRANSMIT_DONE, b"")
                     self._sent_z = True
                 return
             await self._open_next_file_async()
@@ -218,6 +244,21 @@ class WSLinkSession:
             self.window_size = max(1, int(self.window_size * 0.9))
 
     async def _handle_packet(self, pkt_type: bytes, payload: bytes):
+        # Heartbeat: PING/PONG allowed in any state (keepalive)
+        if pkt_type == PACK_PING:
+            # Respond with PONG (echo payload back for RTT measurement)
+            await self.framer.send_packet_immediate(PACK_PONG, payload)
+            log.debug("Heartbeat PONG sent (reply to PING)")
+            return
+
+        if pkt_type == PACK_PONG:
+            # Measure RTT from ping timestamp
+            if len(payload) >= 8:
+                ping_time = struct.unpack('<d', payload[:8])[0]
+                rtt = time.time() - ping_time
+                log.debug(f"Heartbeat PONG received (RTT: {rtt*1000:.1f}ms)")
+            return
+
         # Chat is allowed in any state (out-of-band messaging)
         if pkt_type == PACK_CHAT_BLOCK:
             if self.on_chat_received:
@@ -418,6 +459,7 @@ class WSLinkSession:
                 
         elif pkt_type == PACK_TRANSMIT_DONE:
             log.info("Peer signaled all files transmitted (Z).")
-            if not self.recv_fd and len(self.unacked_blocks) == 0:
-                log.info("Receive queue empty, transitioning to DONE.")
-                self.state = "DONE"
+            # NOTE: Do NOT transition to DONE here. The chat channel (used for
+            # JSON-RPC MCP traffic in the Unimind router) must remain active
+            # after file transfer completes. Only explicit WebSocket close or
+            # idle timeout should end the session.
