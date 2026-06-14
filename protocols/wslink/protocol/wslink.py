@@ -47,6 +47,7 @@ class WSLinkSession:
         
         self.on_chat_received = None
         self._sent_z = False
+        self._send_event = asyncio.Event()
         
     def add_files(self, file_paths):
         self.files_to_send.extend(file_paths)
@@ -94,7 +95,13 @@ class WSLinkSession:
                     log.error(f"Sender error: {e}\n{traceback.format_exc()}")
                     self.state = "DONE"
 
-            await asyncio.sleep(0.01)
+            # Wait for signal (ACK freed window space, state change, etc.)
+            # or timeout for ARQ retransmit check
+            self._send_event.clear()
+            try:
+                await asyncio.wait_for(self._send_event.wait(), timeout=self.arq_timeout)
+            except asyncio.TimeoutError:
+                pass  # Timeout — check for retransmits
 
     def _open_next_file(self):
         if not self.files_to_send:
@@ -225,6 +232,7 @@ class WSLinkSession:
             if self.state == "INIT":
                 log.info("Handshake sync complete. Connection established.")
                 self.state = "TRANSFERRING"
+                self._send_event.set()  # Wake sender to start transfer
                 
         elif pkt_type == PACK_ACK_BLOCK:
             seq = SequencePacket.unpack(payload)
@@ -241,6 +249,8 @@ class WSLinkSession:
                     del self.unacked_blocks[k]
                     if k in self.block_send_times:
                         del self.block_send_times[k]
+                
+                self._send_event.set()  # Wake sender — window space freed
 
         elif pkt_type == PACK_NAK_BLOCK:
             seq = SequencePacket.unpack(payload)
@@ -320,6 +330,7 @@ class WSLinkSession:
             self.unacked_blocks.clear()
             self.block_send_times.clear()
             self.next_block_num = self.total_blocks
+            self._send_event.set()  # Wake sender — file skipped, move to next
             
         elif pkt_type == PACK_VERIFY_BLOCK:
             v_header = ResumeVerifyPacket.unpack_header(payload)
