@@ -31,10 +31,12 @@ pub const PACK_CHAT_BLOCK: u8 = b'H';
 pub const PACK_SKIP_FILE: u8 = b'K';
 pub const PACK_NAK_BLOCK: u8 = b'N';
 pub const PACK_OPEN_FILE: u8 = b'O';
+pub const PACK_PING: u8 = b'P';       // Heartbeat ping (keepalive)
 pub const PACK_READY_RECV: u8 = b'Q';
 pub const PACK_READY: u8 = b'R';
 pub const PACK_SEEK_BLOCK: u8 = b'S';
 pub const PACK_VERIFY_BLOCK: u8 = b'V';
+pub const PACK_PONG: u8 = b'W';       // Heartbeat pong (response to ping)
 pub const PACK_TRANSMIT_DONE: u8 = b'Z';
 
 pub const MAX_BLOCK_SIZE: usize = 65536; // 64KB max (negotiable)
@@ -48,10 +50,12 @@ pub fn register_constants(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PACK_SKIP_FILE", PACK_SKIP_FILE)?;
     m.add("PACK_NAK_BLOCK", PACK_NAK_BLOCK)?;
     m.add("PACK_OPEN_FILE", PACK_OPEN_FILE)?;
+    m.add("PACK_PING", PACK_PING)?;
     m.add("PACK_READY_RECV", PACK_READY_RECV)?;
     m.add("PACK_READY", PACK_READY)?;
     m.add("PACK_SEEK_BLOCK", PACK_SEEK_BLOCK)?;
     m.add("PACK_VERIFY_BLOCK", PACK_VERIFY_BLOCK)?;
+    m.add("PACK_PONG", PACK_PONG)?;
     m.add("PACK_TRANSMIT_DONE", PACK_TRANSMIT_DONE)?;
     m.add("MAX_BLOCK_SIZE", MAX_BLOCK_SIZE)?;
     Ok(())
