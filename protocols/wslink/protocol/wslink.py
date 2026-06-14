@@ -40,6 +40,7 @@ class WSLinkSession:
         self.window_size = kwargs.get('initial_window', 16)
         self.max_window_size = kwargs.get('max_window', 256)
         self.arq_timeout = kwargs.get('arq_timeout', 2.0)
+        self.idle_timeout = kwargs.get('idle_timeout', 60.0)
         self.verify_limit = kwargs.get('verify_limit', 100)
         self.rtt_history_size = kwargs.get('rtt_history_size', 20)
         self.block_send_times = {}
@@ -71,7 +72,15 @@ class WSLinkSession:
         
     async def _recv_loop(self):
         while self.state != "DONE":
-            packet = await self.framer.read_packet()
+            try:
+                packet = await asyncio.wait_for(
+                    self.framer.read_packet(), timeout=self.idle_timeout
+                )
+            except asyncio.TimeoutError:
+                log.warning(f"Idle timeout — no data received in {self.idle_timeout}s. Closing session.")
+                self.state = "DONE"
+                break
+                
             if not packet:
                 # EOF or dropped connection
                 log.info("Connection closed by peer or read timeout.")
