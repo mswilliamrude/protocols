@@ -6,3 +6,7 @@ __pycache__/
 *.pyc
 hsaio.py
 dgdg.py
+
+# OpenCode local config (machine-specific paths)
+opencode.json
+.opencode/
