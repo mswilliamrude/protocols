@@ -12,7 +12,7 @@ from pathlib import Path
 
 # Add the current directory to the Python path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from modem.protocol.zmodem import ZMODEM
+from .protocol.zmodem import ZMODEM
 
 def getc(size, timeout=1):
     import select
@@ -341,7 +341,7 @@ def main():
         finally:
             try:
                 if old_settings:
-                termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+                    termios.tcsetattr(fd, termios.TCSANOW, old_settings)
             except termios.error:
                 pass
             
@@ -389,7 +389,7 @@ def main():
         finally:
             try:
                 if old_settings:
-                termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+                    termios.tcsetattr(fd, termios.TCSANOW, old_settings)
             except termios.error:
                 pass
 

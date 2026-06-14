@@ -1,10 +1,10 @@
 import glob
 import os
 import time
-from modem import const
-from modem.tools import log
-from modem.protocol.xmodem import XMODEM
-from modem import error
+from .. import const
+from ..tools import log
+from .xmodem import XMODEM
+from .. import error
 
 
 class YMODEM(XMODEM):

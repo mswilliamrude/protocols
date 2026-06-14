@@ -1,7 +1,7 @@
 import struct
 import logging
 from zlib import crc32 as _crc32
-from modem.const import CRC16_MAP
+from .const import CRC16_MAP
 from collections.abc import Iterable
 
 

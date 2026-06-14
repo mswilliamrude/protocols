@@ -12,7 +12,7 @@ import select
 
 # Import our patched modem module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from modem.protocol.zmodem import ZMODEM
+from .protocol.zmodem import ZMODEM
 
 def getc(size, timeout=1):
     r, _, _ = select.select([sys.stdin.fileno()], [], [], timeout)

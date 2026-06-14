@@ -1,8 +1,8 @@
 import time
-from modem import error
-from modem.base import Modem
-from modem import const
-from modem.tools import log
+from .. import error
+from ..base import Modem
+from .. import const
+from ..tools import log
 
 
 class XMODEM(Modem):

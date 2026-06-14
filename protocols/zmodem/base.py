@@ -1,4 +1,4 @@
-from modem.tools import crc16, crc32
+from .tools import crc16, crc32
 
 
 class Modem(object):

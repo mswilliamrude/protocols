@@ -1,9 +1,9 @@
 import datetime
 import os
 import time
-from modem.base import Modem
-from modem import const
-from modem.tools import log
+from ..base import Modem
+from .. import const
+from ..tools import log
 
 
 class ZMODEM(Modem):
