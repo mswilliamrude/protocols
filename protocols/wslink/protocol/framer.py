@@ -4,6 +4,10 @@ import logging
 
 log = logging.getLogger(__name__)
 
+# Maximum frame size: 1MB. Generous for 64KB blocks + headers.
+# Prevents OOM from malicious/corrupted length fields (uint32 max = 4GB).
+MAX_FRAME_SIZE = 1 * 1024 * 1024
+
 class WSLinkFramer:
     """
     Modern Length-Prefixed Clean Pipe Framer.
@@ -22,6 +26,10 @@ class WSLinkFramer:
         if length < 5: # min: 1 byte type + 4 byte CRC
             log.warning(f"Invalid frame length: {length}")
             return b'?', b''
+        
+        if length > MAX_FRAME_SIZE:
+            log.error(f"Frame length {length} exceeds MAX_FRAME_SIZE ({MAX_FRAME_SIZE}). Dropping connection.")
+            return None
             
         packet_data = await self.transport.read_exactly(length)
         if len(packet_data) < length:
