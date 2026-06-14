@@ -238,19 +238,28 @@ class WSLinkSession:
             self.window_size = max(1, int(self.window_size * 0.9))
 
     async def _handle_packet(self, pkt_type: bytes, payload: bytes):
+        # Chat is allowed in any state (out-of-band messaging)
         if pkt_type == PACK_CHAT_BLOCK:
             if self.on_chat_received:
                 self.on_chat_received(payload)
             else:
                 log.info(f"Chat received: {payload.decode('utf-8', 'ignore')}")
-                
-        elif pkt_type in (PACK_READY, PACK_READY_RECV):
+            return
+
+        # Handshake packets — only valid in INIT state
+        if pkt_type in (PACK_READY, PACK_READY_RECV):
             if self.state == "INIT":
                 log.info("Handshake sync complete. Connection established.")
                 self.state = "TRANSFERRING"
                 self._send_event.set()  # Wake sender to start transfer
-                
-        elif pkt_type == PACK_ACK_BLOCK:
+            return
+
+        # All other packets require TRANSFERRING state
+        if self.state != "TRANSFERRING":
+            log.warning(f"Rejected packet type {pkt_type!r} in state {self.state} (requires TRANSFERRING)")
+            return
+
+        if pkt_type == PACK_ACK_BLOCK:
             seq = SequencePacket.unpack(payload)
             if seq['batch'] == self.batch_index:
                 ack_block = seq['block']
