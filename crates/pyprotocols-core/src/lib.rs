@@ -39,6 +39,7 @@ fn pyprotocols_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<protocols::wslink::FileHeaderPacket>()?;
     m.add_class::<protocols::wslink::SequencePacket>()?;
     m.add_class::<protocols::wslink::ResumeVerifyPacket>()?;
+    m.add_class::<protocols::wslink::LinkStatsTracker>()?;
 
     // WSLink constants
     protocols::wslink::register_constants(m)?;
