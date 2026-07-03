@@ -383,6 +383,25 @@ impl ResumeVerifyPacket {
 /// Tracks throughput, error rates, congestion state, and transfer progress.
 /// Thread-safe for use from async contexts. Exposed to Python via PyO3.
 ///
+/// ## Parity with the pure-Python session
+/// `snapshot()` is key-for-key compatible with `WSLinkSession.get_link_stats()`
+/// in the Python reference implementation (protocols/wslink/protocol/wslink.py),
+/// with ONE intentional exception: the Python version also emits `"state"`
+/// (the session FSM state, e.g. "INIT"/"TRANSFERRING"/"DONE"). That key is
+/// Python-only by design — this crate provides no session state machine, only
+/// the accelerated counter/telemetry primitives. A consumer that wants `state`
+/// tracks it at the session layer and merges it into the snapshot dict.
+///
+/// ## Session-layer fixes NOT reflected here
+/// Two WSLink correctness fixes live exclusively in the Python `WSLinkSession`
+/// because they concern the send/recv event loop, which has no Rust counterpart:
+///   1. `add_files()` must set the send-loop wake event, or files queued after
+///      the session is already running deadlock (never transmitted).
+///   2. The receive loop must discard frames the framer flags as corrupt
+///      (`b'?'` sentinel from a CRC/length failure) and count them as
+///      `crc_failures` — which maps to `record_crc_failure()` on this tracker.
+/// If/when a Rust `WSLinkSession` is written, both behaviours must be preserved.
+///
 /// Usage (Python):
 ///   tracker = LinkStatsTracker(block_size=4096, max_window=256)
 ///   tracker.record_block_sent(4096)
