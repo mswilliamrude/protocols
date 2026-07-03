@@ -52,10 +52,172 @@ class WSLinkSession:
         self.on_chat_received = None
         self._sent_z = False
         self._send_event = asyncio.Event()
+
+        # ─── Link Statistics ──────────────────────────────────────────
+        # Real-time telemetry counters. Queried via get_link_stats() at any
+        # time from any coroutine. A parallel accelerated implementation is
+        # available as pyprotocols_core.LinkStatsTracker (Rust/PyO3); this
+        # inline version keeps the pure-Python session self-contained with no
+        # compiled-extension dependency.
+        self._stats_session_start = time.time()
+        self._stats_bytes_sent = 0
+        self._stats_bytes_received = 0
+        self._stats_blocks_acked = 0
+        self._stats_blocks_naked = 0
+        self._stats_blocks_retransmitted = 0
+        self._stats_crc_failures = 0
+        self._stats_files_completed_send = 0
+        self._stats_files_completed_recv = 0
+        self._stats_files_skipped = 0
+        self._stats_window_shrinks = 0
+        self._stats_window_grows = 0
+        self._stats_pings_sent = 0
+        self._stats_pongs_received = 0
+        self._stats_arq_timeouts = 0
+        self._stats_transfer_start = 0.0  # time of first data block in current file
+        self._stats_current_file_size = 0
         
     def add_files(self, file_paths):
         self.files_to_send.extend(file_paths)
+        # Wake the send loop. Without this, files queued AFTER the session is
+        # already running (dynamic add — e.g. a server queueing a freshly
+        # rendered screenshot mid-session) are never transmitted: the send
+        # loop sits blocked on `await self._send_event.wait()` (see _send_loop)
+        # with no signal to re-pump. Queueing != sending; the producer MUST
+        # wake the consumer. Safe to call before loop() starts too (the event
+        # simply stays set until the first clear() at the top of _send_loop).
+        self._send_event.set()
         
+    def get_link_stats(self) -> dict:
+        """Query connection statistics: throughput, error rates, congestion state.
+
+        Returns a dict suitable for JSON serialization with all link metrics.
+        Can be called at any time — safe from any coroutine or thread.
+        """
+        now = time.time()
+        session_elapsed = now - self._stats_session_start
+
+        # RTT statistics
+        rtt_samples = list(self.rtt_history)
+        if rtt_samples:
+            rtt_avg = sum(rtt_samples) / len(rtt_samples)
+            rtt_min = min(rtt_samples)
+            rtt_max = max(rtt_samples)
+        else:
+            rtt_avg = rtt_min = rtt_max = 0.0
+
+        # Throughput calculation (based on bytes sent over session lifetime)
+        total_bytes = self._stats_bytes_sent + self._stats_bytes_received
+        if session_elapsed > 0:
+            throughput_bps = (total_bytes * 8) / session_elapsed
+            throughput_kbps = throughput_bps / 1000
+            throughput_mbps = throughput_bps / 1_000_000
+        else:
+            throughput_kbps = throughput_mbps = 0.0
+
+        # Instantaneous throughput (last RTT window worth of data)
+        if rtt_avg > 0 and self.window_size > 0:
+            instant_bps = (self.window_size * self.block_size * 8) / rtt_avg
+            instant_kbps = instant_bps / 1000
+            instant_mbps = instant_bps / 1_000_000
+        else:
+            instant_kbps = instant_mbps = 0.0
+
+        # Error rate
+        total_blocks_attempted = self._stats_blocks_acked + self._stats_blocks_naked + self._stats_blocks_retransmitted
+        if total_blocks_attempted > 0:
+            error_rate = (self._stats_blocks_naked + self._stats_blocks_retransmitted) / total_blocks_attempted
+        else:
+            error_rate = 0.0
+
+        # Window utilization
+        if self.window_size > 0:
+            window_utilization = len(self.unacked_blocks) / self.window_size
+        else:
+            window_utilization = 0.0
+
+        # Transfer progress (current file)
+        if self.total_blocks > 0:
+            transfer_progress = self.next_block_num / self.total_blocks
+            bytes_remaining = (self.total_blocks - self.next_block_num) * self.block_size
+        else:
+            transfer_progress = 0.0
+            bytes_remaining = 0
+
+        # ETA for current file
+        if self._stats_transfer_start > 0 and self.next_block_num > 0:
+            elapsed_file = now - self._stats_transfer_start
+            blocks_done = self.next_block_num
+            blocks_left = self.total_blocks - blocks_done
+            if blocks_done > 0:
+                time_per_block = elapsed_file / blocks_done
+                eta_seconds = blocks_left * time_per_block
+            else:
+                eta_seconds = 0.0
+        else:
+            eta_seconds = 0.0
+
+        return {
+            # Connection state
+            "state": self.state,
+            "session_elapsed_s": round(session_elapsed, 2),
+
+            # RTT (milliseconds)
+            "rtt_avg_ms": round(rtt_avg * 1000, 2),
+            "rtt_min_ms": round(rtt_min * 1000, 2),
+            "rtt_max_ms": round(rtt_max * 1000, 2),
+            "rtt_samples": len(rtt_samples),
+
+            # Congestion window
+            "window_size": self.window_size,
+            "window_max": self.max_window_size,
+            "window_utilization": round(window_utilization, 3),
+            "window_grows": self._stats_window_grows,
+            "window_shrinks": self._stats_window_shrinks,
+            "in_flight_blocks": len(self.unacked_blocks),
+
+            # Throughput
+            "throughput_avg_kbps": round(throughput_kbps, 1),
+            "throughput_avg_mbps": round(throughput_mbps, 3),
+            "throughput_instant_kbps": round(instant_kbps, 1),
+            "throughput_instant_mbps": round(instant_mbps, 3),
+
+            # Data volume
+            "bytes_sent": self._stats_bytes_sent,
+            "bytes_received": self._stats_bytes_received,
+            "bytes_total": total_bytes,
+            "bytes_remaining": bytes_remaining,
+
+            # Block-level counters
+            "blocks_acked": self._stats_blocks_acked,
+            "blocks_naked": self._stats_blocks_naked,
+            "blocks_retransmitted": self._stats_blocks_retransmitted,
+            "arq_timeouts": self._stats_arq_timeouts,
+
+            # Integrity
+            "crc_failures": self._stats_crc_failures,
+            "error_rate": round(error_rate, 5),
+
+            # File transfer progress
+            "files_completed_send": self._stats_files_completed_send,
+            "files_completed_recv": self._stats_files_completed_recv,
+            "files_skipped": self._stats_files_skipped,
+            "files_queued": len(self.files_to_send),
+            "current_file": os.path.basename(self.current_file) if self.current_file else None,
+            "current_file_size": self._stats_current_file_size,
+            "transfer_progress": round(transfer_progress, 4),
+            "transfer_eta_s": round(eta_seconds, 1),
+
+            # Heartbeat
+            "pings_sent": self._stats_pings_sent,
+            "pongs_received": self._stats_pongs_received,
+
+            # Config
+            "block_size": self.block_size,
+            "arq_timeout_s": self.arq_timeout,
+            "heartbeat_interval_s": self.heartbeat_interval,
+        }
+
     async def send_chat(self, message: bytes):
         await self.framer.send_packet_immediate(PACK_CHAT_BLOCK, message)
         
@@ -85,6 +247,7 @@ class WSLinkSession:
                 # Send PING with timestamp for RTT measurement
                 payload = struct.pack('<d', time.time())
                 await self.framer.send_packet_immediate(PACK_PING, payload)
+                self._stats_pings_sent += 1
                 log.debug("Heartbeat PING sent")
             except Exception as e:
                 log.warning(f"Heartbeat send failed: {e}")
@@ -113,6 +276,17 @@ class WSLinkSession:
                 break
                 
             pkt_type, payload = packet
+
+            # Integrity guard: the framer returns (b'?', b'') on a CRC mismatch
+            # or an invalid frame length (see WSLinkFramer.read_packet). Discard
+            # the corrupt frame explicitly rather than letting b'?' fall through
+            # to _handle_packet, where it would trip the state-machine guard and
+            # log a misleading "rejected packet type" warning. Counting these
+            # separately gives real integrity-error visibility in link stats.
+            if pkt_type == b'?':
+                self._stats_crc_failures += 1
+                log.warning("CRC integrity failure detected, frame discarded.")
+                continue
 
             try:
                 await self._handle_packet(pkt_type, payload)
@@ -170,6 +344,8 @@ class WSLinkSession:
         self.next_block_num = 0
         self.unacked_blocks.clear()
         self.block_send_times.clear()
+        self._stats_current_file_size = size
+        self._stats_transfer_start = time.time()
 
     async def _pump_sender(self):
         if self._sent_z:
@@ -196,9 +372,13 @@ class WSLinkSession:
             if current_time - send_time > self.arq_timeout:
                 log.warning(f"ARQ Timeout! Resending block {oldest_block}. Throttling window.")
                 self.window_size = max(1, self.window_size // 2) # Halve window on timeout
+                self._stats_window_shrinks += 1
+                self._stats_arq_timeouts += 1
+                self._stats_blocks_retransmitted += 1
                 
                 stored_payload = self.unacked_blocks[oldest_block]
                 await self.framer.send_packet_immediate(PACK_DATA_BLOCK, stored_payload)
+                self._stats_bytes_sent += len(stored_payload)
                 self.block_send_times[oldest_block] = current_time # Reset timer
                 
         # Fill Window — buffer all data frames, flush once at the end
@@ -216,6 +396,7 @@ class WSLinkSession:
             self.block_send_times[self.next_block_num] = fill_time
             
             await self.framer.send_packet(PACK_DATA_BLOCK, payload)
+            self._stats_bytes_sent += len(chunk)
             self.next_block_num += 1
             sent_any = True
 
@@ -230,6 +411,9 @@ class WSLinkSession:
             self.current_fd.close()
             self.current_file = None
             self.batch_index += 1
+            self._stats_files_completed_send += 1
+            self._stats_transfer_start = 0.0
+            self._stats_current_file_size = 0
 
     def _update_rtt(self, rtt: float):
         self.rtt_history.append(rtt)  # deque(maxlen=N) auto-evicts oldest
@@ -239,9 +423,11 @@ class WSLinkSession:
         # BBR-style naive scale: if link is fast and window is full, increase window.
         if avg_rtt < 0.1 and len(self.unacked_blocks) >= self.window_size * 0.8:
             self.window_size = min(self.max_window_size, self.window_size + 1)
+            self._stats_window_grows += 1
         elif avg_rtt > 0.5:
             # Bufferbloat detected, scale back gently
             self.window_size = max(1, int(self.window_size * 0.9))
+            self._stats_window_shrinks += 1
 
     async def _handle_packet(self, pkt_type: bytes, payload: bytes):
         # Heartbeat: PING/PONG allowed in any state (keepalive)
@@ -256,6 +442,7 @@ class WSLinkSession:
             if len(payload) >= 8:
                 ping_time = struct.unpack('<d', payload[:8])[0]
                 rtt = time.time() - ping_time
+                self._stats_pongs_received += 1
                 log.debug(f"Heartbeat PONG received (RTT: {rtt*1000:.1f}ms)")
             return
 
@@ -300,6 +487,7 @@ class WSLinkSession:
                 if ack_block in self.block_send_times:
                     del self.block_send_times[ack_block]
                 
+                self._stats_blocks_acked += 1
                 self._send_event.set()  # Wake sender — window space freed
 
         elif pkt_type == PACK_NAK_BLOCK:
@@ -309,8 +497,12 @@ class WSLinkSession:
                 if nak_block in self.unacked_blocks:
                     log.warning(f"Received NAK for block {nak_block}. Resending.")
                     self.window_size = max(1, self.window_size // 2) # Halve on drop
+                    self._stats_window_shrinks += 1
+                    self._stats_blocks_naked += 1
+                    self._stats_blocks_retransmitted += 1
                     stored_payload = self.unacked_blocks[nak_block]
                     await self.framer.send_packet_immediate(PACK_DATA_BLOCK, stored_payload)
+                    self._stats_bytes_sent += len(stored_payload)
                     self.block_send_times[nak_block] = time.time()
                 
         elif pkt_type == PACK_OPEN_FILE:
@@ -372,6 +564,7 @@ class WSLinkSession:
             chunk = payload[seq_size:]
             
             if seq['batch'] == self.recv_batch_index:
+                self._stats_bytes_received += len(chunk)
                 if seq['block'] == self.recv_expected_block:
                     if self.recv_fd:
                         self.recv_fd.write(chunk)
@@ -393,6 +586,9 @@ class WSLinkSession:
             self.unacked_blocks.clear()
             self.block_send_times.clear()
             self.next_block_num = self.total_blocks
+            self._stats_files_skipped += 1
+            self._stats_transfer_start = 0.0
+            self._stats_current_file_size = 0
             self._send_event.set()  # Wake sender — file skipped, move to next
             
         elif pkt_type == PACK_VERIFY_BLOCK:
@@ -450,6 +646,7 @@ class WSLinkSession:
                 self.recv_fd.close()
                 self.recv_fd = None
                 log.info(f"File {self.recv_file} successfully received and closed.")
+                self._stats_files_completed_recv += 1
                 if self.recv_file_time:
                     try:
                         os.utime(self.recv_file, (time.time(), self.recv_file_time))
