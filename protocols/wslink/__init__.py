@@ -1,6 +1,20 @@
 """WSLink protocol — bidirectional file transfer + socket proxy."""
 
 from .channel import ChannelMux, ChannelState, Channel, get_channel_mux
+from .handlers import (
+    TargetHandler,
+    TargetType,
+    TargetConfig,
+    TargetPolicy,
+    HandlerStats,
+    UnixSocketHandler,
+    TCPHandler,
+    SSHAgentHandler,
+    get_handler,
+    register_handler,
+    DEFAULT_POLICY,
+)
+from .proxy import SocketProxy, ProxyStats, create_proxy
 from .const import (
     # Packet types
     PACK_SOCKET_OPEN,
@@ -32,11 +46,27 @@ from .const import (
 )
 
 __all__ = [
-    # Classes
+    # Channel classes
     "ChannelMux",
     "ChannelState", 
     "Channel",
     "get_channel_mux",
+    # Target handlers
+    "TargetHandler",
+    "TargetType",
+    "TargetConfig",
+    "TargetPolicy",
+    "HandlerStats",
+    "UnixSocketHandler",
+    "TCPHandler",
+    "SSHAgentHandler",
+    "get_handler",
+    "register_handler",
+    "DEFAULT_POLICY",
+    # Socket proxy
+    "SocketProxy",
+    "ProxyStats",
+    "create_proxy",
     # Packet types
     "PACK_SOCKET_OPEN",
     "PACK_SOCKET_DATA",
