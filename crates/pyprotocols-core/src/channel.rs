@@ -26,7 +26,7 @@
 
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 use std::collections::HashMap;
 
 use crate::protocols::wslink::{
@@ -242,7 +242,7 @@ impl ChannelMux {
     ///
     /// Returns: (channel_id, open_packet_bytes)
     /// Raises: ValueError if max channels reached
-    pub fn open_channel(&mut self, target: &str, flags: u8) -> PyResult<(u16, Vec<u8>)> {
+    pub fn open_channel(&mut self, py: Python<'_>, target: &str, flags: u8) -> PyResult<(u16, Py<PyBytes>)> {
         if self.channels.len() >= self.max_channels {
             return Err(PyValueError::new_err(format!(
                 "max channels ({}) reached",
@@ -270,13 +270,13 @@ impl ChannelMux {
 
         // Build OPEN packet
         let packet = SocketOpenPacket::pack(id, flags, target);
-        Ok((id, packet))
+        Ok((id, PyBytes::new_bound(py, &packet).unbind()))
     }
 
     /// Handle an incoming SOCKET_OPEN from peer.
     ///
     /// Returns: (channel_id, window_packet_bytes) to send back
-    pub fn handle_open(&mut self, channel_id: u16, flags: u8, target: &str) -> PyResult<(u16, Vec<u8>)> {
+    pub fn handle_open(&mut self, py: Python<'_>, channel_id: u16, flags: u8, target: &str) -> PyResult<(u16, Py<PyBytes>)> {
         // Validate channel ID parity (should be from peer's side)
         let is_peer_initiated = if self.is_client {
             channel_id % 2 == 0 // Server uses even
@@ -309,13 +309,13 @@ impl ChannelMux {
 
         // Send initial WINDOW to grant credit
         let window_packet = SocketWindowPacket::pack(channel_id, CHANNEL_INITIAL_CREDIT);
-        Ok((channel_id, window_packet))
+        Ok((channel_id, PyBytes::new_bound(py, &window_packet).unbind()))
     }
 
     /// Prepare to send data on a channel.
     ///
     /// Returns: data_packet_bytes or None if no credit available
-    pub fn send_data(&mut self, channel_id: u16, data: &[u8]) -> PyResult<Option<Vec<u8>>> {
+    pub fn send_data(&mut self, py: Python<'_>, channel_id: u16, data: &[u8]) -> PyResult<Option<Py<PyBytes>>> {
         let channel = self.channels.get_mut(&channel_id)
             .ok_or_else(|| PyValueError::new_err(format!("unknown channel {}", channel_id)))?;
 
@@ -333,13 +333,13 @@ impl ChannelMux {
 
         channel.consume_send_credit(data.len());
         let packet = SocketDataPacket::pack(channel_id, data);
-        Ok(Some(packet))
+        Ok(Some(PyBytes::new_bound(py, &packet).unbind()))
     }
 
     /// Handle incoming data on a channel.
     ///
     /// Returns: (data, should_send_window)
-    pub fn handle_data(&mut self, channel_id: u16, data: Vec<u8>) -> PyResult<(Vec<u8>, bool)> {
+    pub fn handle_data(&mut self, py: Python<'_>, channel_id: u16, data: &[u8]) -> PyResult<(Py<PyBytes>, bool)> {
         let channel = self.channels.get_mut(&channel_id)
             .ok_or_else(|| PyValueError::new_err(format!("unknown channel {}", channel_id)))?;
 
@@ -354,7 +354,7 @@ impl ChannelMux {
         channel.consume_recv_credit(data.len());
         let needs_window = channel.needs_window_update();
 
-        Ok((data, needs_window))
+        Ok((PyBytes::new_bound(py, data).unbind(), needs_window))
     }
 
     /// Handle incoming WINDOW update.
@@ -367,29 +367,29 @@ impl ChannelMux {
     }
 
     /// Build a WINDOW packet to grant more recv credit to peer.
-    pub fn grant_window(&mut self, channel_id: u16, credit: u32) -> PyResult<Vec<u8>> {
+    pub fn grant_window(&mut self, py: Python<'_>, channel_id: u16, credit: u32) -> PyResult<Py<PyBytes>> {
         let channel = self.channels.get_mut(&channel_id)
             .ok_or_else(|| PyValueError::new_err(format!("unknown channel {}", channel_id)))?;
 
         channel.add_recv_credit(credit);
-        Ok(SocketWindowPacket::pack(channel_id, credit))
+        Ok(PyBytes::new_bound(py, &SocketWindowPacket::pack(channel_id, credit)).unbind())
     }
 
     /// Close a channel gracefully.
     ///
     /// Returns: close_packet_bytes
-    pub fn close_channel(&mut self, channel_id: u16, code: u16) -> PyResult<Vec<u8>> {
+    pub fn close_channel(&mut self, py: Python<'_>, channel_id: u16, code: u16) -> PyResult<Py<PyBytes>> {
         let channel = self.channels.get_mut(&channel_id)
             .ok_or_else(|| PyValueError::new_err(format!("unknown channel {}", channel_id)))?;
 
         channel.state = ChannelState::Closing;
-        Ok(SocketClosePacket::pack(channel_id, code))
+        Ok(PyBytes::new_bound(py, &SocketClosePacket::pack(channel_id, code)).unbind())
     }
 
     /// Handle incoming CLOSE from peer.
     ///
     /// Returns: (should_send_close_back, close_packet_bytes_if_any)
-    pub fn handle_close(&mut self, channel_id: u16, _code: u16) -> PyResult<(bool, Option<Vec<u8>>)> {
+    pub fn handle_close(&mut self, py: Python<'_>, channel_id: u16, _code: u16) -> PyResult<(bool, Option<Py<PyBytes>>)> {
         let channel = self.channels.get_mut(&channel_id)
             .ok_or_else(|| PyValueError::new_err(format!("unknown channel {}", channel_id)))?;
 
@@ -398,7 +398,7 @@ impl ChannelMux {
         self.total_closed += 1;
 
         if send_close_back {
-            Ok((true, Some(SocketClosePacket::pack(channel_id, CHANNEL_CLOSE_NORMAL))))
+            Ok((true, Some(PyBytes::new_bound(py, &SocketClosePacket::pack(channel_id, CHANNEL_CLOSE_NORMAL)).unbind())))
         } else {
             Ok((false, None))
         }
@@ -421,12 +421,12 @@ impl ChannelMux {
     }
 
     /// Send an error notification on a channel.
-    pub fn send_error(&mut self, channel_id: u16, code: u16, message: &str) -> PyResult<Vec<u8>> {
+    pub fn send_error(&mut self, py: Python<'_>, channel_id: u16, code: u16, message: &str) -> PyResult<Py<PyBytes>> {
         // Verify channel exists
         if !self.channels.contains_key(&channel_id) {
             return Err(PyValueError::new_err(format!("unknown channel {}", channel_id)));
         }
-        Ok(SocketErrorPacket::pack(channel_id, code, message))
+        Ok(PyBytes::new_bound(py, &SocketErrorPacket::pack(channel_id, code, message)).unbind())
     }
 
     /// Get channel info as a dict.
