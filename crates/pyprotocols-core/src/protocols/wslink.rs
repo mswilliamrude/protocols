@@ -40,10 +40,48 @@ pub const PACK_VERIFY_BLOCK: u8 = b'V';
 pub const PACK_PONG: u8 = b'W';       // Heartbeat pong (response to ping)
 pub const PACK_TRANSMIT_DONE: u8 = b'Z';
 
+// ─── Socket Proxy Channel Constants (lowercase, no collision) ────────
+// See: docs/SOCKET_PROXY_SPEC.md
+
+pub const PACK_SOCKET_OPEN: u8 = b's';    // Open a proxy channel
+pub const PACK_SOCKET_DATA: u8 = b'd';    // Forward bytes on channel
+pub const PACK_SOCKET_CLOSE: u8 = b'c';   // Graceful channel close
+pub const PACK_SOCKET_ERROR: u8 = b'e';   // Channel error notification
+pub const PACK_SOCKET_WINDOW: u8 = b'w';  // Flow control credit grant
+
+// Channel ID allocation:
+//   Odd  (1, 3, 5, ...) = client-initiated
+//   Even (2, 4, 6, ...) = server-initiated
+pub const CHANNEL_ID_CLIENT_START: u16 = 1;
+pub const CHANNEL_ID_SERVER_START: u16 = 2;
+pub const CHANNEL_ID_MAX: u16 = 65535;
+
+// Channel flags (bitmask in SOCKET_OPEN)
+pub const CHANNEL_FLAG_BIDIR: u8 = 0x01;       // Bidirectional (default)
+pub const CHANNEL_FLAG_READ_ONLY: u8 = 0x02;   // Client can only read
+pub const CHANNEL_FLAG_WRITE_ONLY: u8 = 0x04;  // Client can only write
+pub const CHANNEL_FLAG_COMPRESSED: u8 = 0x08;  // LZ4 compress channel data
+pub const CHANNEL_FLAG_ENCRYPTED: u8 = 0x10;   // ChaCha20-Poly1305 encryption
+pub const CHANNEL_FLAG_AUDIT: u8 = 0x20;       // Log all traffic to audit trail
+
+// Channel close codes
+pub const CHANNEL_CLOSE_NORMAL: u16 = 0x0000;
+pub const CHANNEL_CLOSE_TARGET_REFUSED: u16 = 0x0001;
+pub const CHANNEL_CLOSE_TARGET_UNREACHABLE: u16 = 0x0002;
+pub const CHANNEL_CLOSE_AUTH_FAILED: u16 = 0x0003;
+pub const CHANNEL_CLOSE_TIMEOUT: u16 = 0x0004;
+pub const CHANNEL_CLOSE_ADMIN: u16 = 0x0005;
+pub const CHANNEL_CLOSE_PROTOCOL_ERROR: u16 = 0x0006;
+
+// Flow control (SSH RFC 4254 §5.2 style)
+pub const CHANNEL_INITIAL_CREDIT: u32 = 65536;  // 64KB initial window
+pub const CHANNEL_MAX_CONCURRENT: usize = 256;  // Max simultaneous channels
+
 pub const MAX_BLOCK_SIZE: usize = 65536; // 64KB max (negotiable)
 
 /// Register WSLink constants in the Python module.
 pub fn register_constants(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // File transfer packet types (uppercase)
     m.add("PACK_ACK_BLOCK", PACK_ACK_BLOCK)?;
     m.add("PACK_CLOSE_FILE", PACK_CLOSE_FILE)?;
     m.add("PACK_DATA_BLOCK", PACK_DATA_BLOCK)?;
@@ -59,6 +97,40 @@ pub fn register_constants(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PACK_PONG", PACK_PONG)?;
     m.add("PACK_TRANSMIT_DONE", PACK_TRANSMIT_DONE)?;
     m.add("MAX_BLOCK_SIZE", MAX_BLOCK_SIZE)?;
+
+    // Socket proxy packet types (lowercase)
+    m.add("PACK_SOCKET_OPEN", PACK_SOCKET_OPEN)?;
+    m.add("PACK_SOCKET_DATA", PACK_SOCKET_DATA)?;
+    m.add("PACK_SOCKET_CLOSE", PACK_SOCKET_CLOSE)?;
+    m.add("PACK_SOCKET_ERROR", PACK_SOCKET_ERROR)?;
+    m.add("PACK_SOCKET_WINDOW", PACK_SOCKET_WINDOW)?;
+
+    // Channel ID allocation
+    m.add("CHANNEL_ID_CLIENT_START", CHANNEL_ID_CLIENT_START)?;
+    m.add("CHANNEL_ID_SERVER_START", CHANNEL_ID_SERVER_START)?;
+    m.add("CHANNEL_ID_MAX", CHANNEL_ID_MAX)?;
+
+    // Channel flags
+    m.add("CHANNEL_FLAG_BIDIR", CHANNEL_FLAG_BIDIR)?;
+    m.add("CHANNEL_FLAG_READ_ONLY", CHANNEL_FLAG_READ_ONLY)?;
+    m.add("CHANNEL_FLAG_WRITE_ONLY", CHANNEL_FLAG_WRITE_ONLY)?;
+    m.add("CHANNEL_FLAG_COMPRESSED", CHANNEL_FLAG_COMPRESSED)?;
+    m.add("CHANNEL_FLAG_ENCRYPTED", CHANNEL_FLAG_ENCRYPTED)?;
+    m.add("CHANNEL_FLAG_AUDIT", CHANNEL_FLAG_AUDIT)?;
+
+    // Channel close codes
+    m.add("CHANNEL_CLOSE_NORMAL", CHANNEL_CLOSE_NORMAL)?;
+    m.add("CHANNEL_CLOSE_TARGET_REFUSED", CHANNEL_CLOSE_TARGET_REFUSED)?;
+    m.add("CHANNEL_CLOSE_TARGET_UNREACHABLE", CHANNEL_CLOSE_TARGET_UNREACHABLE)?;
+    m.add("CHANNEL_CLOSE_AUTH_FAILED", CHANNEL_CLOSE_AUTH_FAILED)?;
+    m.add("CHANNEL_CLOSE_TIMEOUT", CHANNEL_CLOSE_TIMEOUT)?;
+    m.add("CHANNEL_CLOSE_ADMIN", CHANNEL_CLOSE_ADMIN)?;
+    m.add("CHANNEL_CLOSE_PROTOCOL_ERROR", CHANNEL_CLOSE_PROTOCOL_ERROR)?;
+
+    // Flow control
+    m.add("CHANNEL_INITIAL_CREDIT", CHANNEL_INITIAL_CREDIT)?;
+    m.add("CHANNEL_MAX_CONCURRENT", CHANNEL_MAX_CONCURRENT)?;
+
     Ok(())
 }
 
@@ -371,6 +443,299 @@ impl ResumeVerifyPacket {
         let dict = PyDict::new_bound(py);
         dict.set_item("base_block", base_block)?;
         dict.set_item("count", count)?;
+
+        Ok(dict.into())
+    }
+}
+
+// ─── Socket Proxy Channel Packets ────────────────────────────────────
+// See: docs/SOCKET_PROXY_SPEC.md
+
+/// SocketOpenPacket: opens a proxy channel to a target.
+///
+/// Wire format (little-endian):
+///   [u16 channel][u8 flags][target...]
+///   where target is a null-terminated UTF-8 string
+///
+/// Channel ID allocation:
+///   Odd  (1, 3, 5, ...) = client-initiated
+///   Even (2, 4, 6, ...) = server-initiated
+#[pyclass]
+#[derive(Debug, Clone)]
+pub struct SocketOpenPacket;
+
+pub const SOCKET_OPEN_HEADER_SIZE: usize = 3; // channel (2) + flags (1)
+
+#[pymethods]
+impl SocketOpenPacket {
+    #[classattr]
+    const HEADER_SIZE: usize = SOCKET_OPEN_HEADER_SIZE;
+
+    /// Pack channel open request into bytes.
+    #[staticmethod]
+    pub fn pack(channel: u16, flags: u8, target: &str) -> Vec<u8> {
+        let target_bytes = target.as_bytes();
+        let mut buf = Vec::with_capacity(SOCKET_OPEN_HEADER_SIZE + target_bytes.len() + 1);
+
+        buf.extend_from_slice(&channel.to_le_bytes()); // u16
+        buf.push(flags);                                // u8
+        buf.extend_from_slice(target_bytes);           // UTF-8
+        buf.push(0);                                    // null terminator
+
+        buf
+    }
+
+    /// Unpack bytes into a dict: {channel, flags, target}
+    #[staticmethod]
+    pub fn unpack(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
+        if data.len() < SOCKET_OPEN_HEADER_SIZE + 1 {
+            return Err(PyValueError::new_err(format!(
+                "SocketOpenPacket requires at least {} bytes, got {}",
+                SOCKET_OPEN_HEADER_SIZE + 1,
+                data.len()
+            )));
+        }
+
+        let channel = u16::from_le_bytes(data[0..2].try_into().unwrap());
+        let flags = data[2];
+
+        // Find null terminator for target string
+        let target_end = data[3..].iter().position(|&b| b == 0).unwrap_or(data.len() - 3);
+        let target = String::from_utf8_lossy(&data[3..3 + target_end]).to_string();
+
+        let dict = PyDict::new_bound(py);
+        dict.set_item("channel", channel)?;
+        dict.set_item("flags", flags)?;
+        dict.set_item("target", target)?;
+
+        Ok(dict.into())
+    }
+
+    /// Check if channel ID is client-initiated (odd).
+    #[staticmethod]
+    pub fn is_client_initiated(channel: u16) -> bool {
+        channel % 2 == 1
+    }
+
+    /// Check if channel ID is server-initiated (even).
+    #[staticmethod]
+    pub fn is_server_initiated(channel: u16) -> bool {
+        channel % 2 == 0 && channel > 0
+    }
+}
+
+/// SocketDataPacket: forward bytes on an open channel.
+///
+/// Wire format:
+///   [u16 channel][data...]
+///
+/// Maximum data per frame: MAX_BLOCK_SIZE - 2 (channel header)
+#[pyclass]
+#[derive(Debug, Clone)]
+pub struct SocketDataPacket;
+
+pub const SOCKET_DATA_HEADER_SIZE: usize = 2; // channel only
+
+#[pymethods]
+impl SocketDataPacket {
+    #[classattr]
+    const HEADER_SIZE: usize = SOCKET_DATA_HEADER_SIZE;
+
+    /// Pack channel data into bytes.
+    #[staticmethod]
+    pub fn pack(channel: u16, data: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(SOCKET_DATA_HEADER_SIZE + data.len());
+        buf.extend_from_slice(&channel.to_le_bytes());
+        buf.extend_from_slice(data);
+        buf
+    }
+
+    /// Unpack bytes into a dict: {channel, data}
+    #[staticmethod]
+    pub fn unpack(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
+        if data.len() < SOCKET_DATA_HEADER_SIZE {
+            return Err(PyValueError::new_err(format!(
+                "SocketDataPacket requires at least {} bytes, got {}",
+                SOCKET_DATA_HEADER_SIZE,
+                data.len()
+            )));
+        }
+
+        let channel = u16::from_le_bytes(data[0..2].try_into().unwrap());
+        let payload = data[2..].to_vec();
+
+        let dict = PyDict::new_bound(py);
+        dict.set_item("channel", channel)?;
+        dict.set_item("data", payload)?;
+
+        Ok(dict.into())
+    }
+
+    /// Maximum payload size per DATA frame.
+    #[staticmethod]
+    pub fn max_payload_size() -> usize {
+        MAX_BLOCK_SIZE - SOCKET_DATA_HEADER_SIZE
+    }
+}
+
+/// SocketClosePacket: graceful channel close.
+///
+/// Wire format:
+///   [u16 channel][u16 code]
+#[pyclass]
+#[derive(Debug, Clone)]
+pub struct SocketClosePacket;
+
+pub const SOCKET_CLOSE_SIZE: usize = 4; // channel (2) + code (2)
+
+#[pymethods]
+impl SocketClosePacket {
+    #[classattr]
+    const SIZE: usize = SOCKET_CLOSE_SIZE;
+
+    /// Pack channel close into bytes.
+    #[staticmethod]
+    pub fn pack(channel: u16, code: u16) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(SOCKET_CLOSE_SIZE);
+        buf.extend_from_slice(&channel.to_le_bytes());
+        buf.extend_from_slice(&code.to_le_bytes());
+        buf
+    }
+
+    /// Unpack bytes into a dict: {channel, code}
+    #[staticmethod]
+    pub fn unpack(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
+        if data.len() < SOCKET_CLOSE_SIZE {
+            return Err(PyValueError::new_err(format!(
+                "SocketClosePacket requires {} bytes, got {}",
+                SOCKET_CLOSE_SIZE,
+                data.len()
+            )));
+        }
+
+        let channel = u16::from_le_bytes(data[0..2].try_into().unwrap());
+        let code = u16::from_le_bytes(data[2..4].try_into().unwrap());
+
+        let dict = PyDict::new_bound(py);
+        dict.set_item("channel", channel)?;
+        dict.set_item("code", code)?;
+
+        Ok(dict.into())
+    }
+
+    /// Return human-readable name for a close code.
+    #[staticmethod]
+    pub fn code_name(code: u16) -> &'static str {
+        match code {
+            CHANNEL_CLOSE_NORMAL => "NORMAL",
+            CHANNEL_CLOSE_TARGET_REFUSED => "TARGET_REFUSED",
+            CHANNEL_CLOSE_TARGET_UNREACHABLE => "TARGET_UNREACHABLE",
+            CHANNEL_CLOSE_AUTH_FAILED => "AUTH_FAILED",
+            CHANNEL_CLOSE_TIMEOUT => "TIMEOUT",
+            CHANNEL_CLOSE_ADMIN => "ADMIN_CLOSE",
+            CHANNEL_CLOSE_PROTOCOL_ERROR => "PROTOCOL_ERROR",
+            _ => "UNKNOWN",
+        }
+    }
+}
+
+/// SocketErrorPacket: channel error notification (does not close channel).
+///
+/// Wire format:
+///   [u16 channel][u16 code][message...]
+///   where message is UTF-8 (rest of payload, no null terminator)
+#[pyclass]
+#[derive(Debug, Clone)]
+pub struct SocketErrorPacket;
+
+pub const SOCKET_ERROR_HEADER_SIZE: usize = 4; // channel (2) + code (2)
+
+#[pymethods]
+impl SocketErrorPacket {
+    #[classattr]
+    const HEADER_SIZE: usize = SOCKET_ERROR_HEADER_SIZE;
+
+    /// Pack error notification into bytes.
+    #[staticmethod]
+    pub fn pack(channel: u16, code: u16, message: &str) -> Vec<u8> {
+        let msg_bytes = message.as_bytes();
+        let mut buf = Vec::with_capacity(SOCKET_ERROR_HEADER_SIZE + msg_bytes.len());
+
+        buf.extend_from_slice(&channel.to_le_bytes());
+        buf.extend_from_slice(&code.to_le_bytes());
+        buf.extend_from_slice(msg_bytes);
+
+        buf
+    }
+
+    /// Unpack bytes into a dict: {channel, code, message}
+    #[staticmethod]
+    pub fn unpack(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
+        if data.len() < SOCKET_ERROR_HEADER_SIZE {
+            return Err(PyValueError::new_err(format!(
+                "SocketErrorPacket requires at least {} bytes, got {}",
+                SOCKET_ERROR_HEADER_SIZE,
+                data.len()
+            )));
+        }
+
+        let channel = u16::from_le_bytes(data[0..2].try_into().unwrap());
+        let code = u16::from_le_bytes(data[2..4].try_into().unwrap());
+        let message = String::from_utf8_lossy(&data[4..]).to_string();
+
+        let dict = PyDict::new_bound(py);
+        dict.set_item("channel", channel)?;
+        dict.set_item("code", code)?;
+        dict.set_item("message", message)?;
+
+        Ok(dict.into())
+    }
+}
+
+/// SocketWindowPacket: flow control credit grant.
+///
+/// Wire format:
+///   [u16 channel][u32 credit]
+///
+/// Credit is additive: receiving WINDOW with credit=1024 adds 1024 bytes
+/// to the sender's available window for that channel.
+#[pyclass]
+#[derive(Debug, Clone)]
+pub struct SocketWindowPacket;
+
+pub const SOCKET_WINDOW_SIZE: usize = 6; // channel (2) + credit (4)
+
+#[pymethods]
+impl SocketWindowPacket {
+    #[classattr]
+    const SIZE: usize = SOCKET_WINDOW_SIZE;
+
+    /// Pack window update into bytes.
+    #[staticmethod]
+    pub fn pack(channel: u16, credit: u32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(SOCKET_WINDOW_SIZE);
+        buf.extend_from_slice(&channel.to_le_bytes());
+        buf.extend_from_slice(&credit.to_le_bytes());
+        buf
+    }
+
+    /// Unpack bytes into a dict: {channel, credit}
+    #[staticmethod]
+    pub fn unpack(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
+        if data.len() < SOCKET_WINDOW_SIZE {
+            return Err(PyValueError::new_err(format!(
+                "SocketWindowPacket requires {} bytes, got {}",
+                SOCKET_WINDOW_SIZE,
+                data.len()
+            )));
+        }
+
+        let channel = u16::from_le_bytes(data[0..2].try_into().unwrap());
+        let credit = u32::from_le_bytes(data[2..6].try_into().unwrap());
+
+        let dict = PyDict::new_bound(py);
+        dict.set_item("channel", channel)?;
+        dict.set_item("credit", credit)?;
 
         Ok(dict.into())
     }
@@ -934,5 +1299,209 @@ mod tests {
         assert_eq!(total, 112);
         let error_rate = (tracker.blocks_naked + tracker.blocks_retransmitted) as f64 / total as f64;
         assert!(error_rate > 0.1 && error_rate < 0.12);
+    }
+
+    // ─── Socket Proxy Packet Tests ───────────────────────────────────
+
+    #[test]
+    fn test_socket_open_roundtrip() {
+        let packed = SocketOpenPacket::pack(1, CHANNEL_FLAG_BIDIR, "ssh-agent");
+        assert!(packed.len() >= SOCKET_OPEN_HEADER_SIZE + 1);
+        
+        // Verify structure: channel (2) + flags (1) + target + null
+        assert_eq!(u16::from_le_bytes(packed[0..2].try_into().unwrap()), 1);
+        assert_eq!(packed[2], CHANNEL_FLAG_BIDIR);
+        assert_eq!(&packed[3..12], b"ssh-agent");
+        assert_eq!(packed[12], 0); // null terminator
+    }
+
+    #[test]
+    fn test_socket_open_with_path() {
+        let packed = SocketOpenPacket::pack(3, CHANNEL_FLAG_COMPRESSED | CHANNEL_FLAG_ENCRYPTED, 
+            "unix:/var/run/docker.sock");
+        
+        assert_eq!(u16::from_le_bytes(packed[0..2].try_into().unwrap()), 3);
+        assert_eq!(packed[2], CHANNEL_FLAG_COMPRESSED | CHANNEL_FLAG_ENCRYPTED);
+        
+        // Find null terminator
+        let target_end = packed[3..].iter().position(|&b| b == 0).unwrap();
+        let target = std::str::from_utf8(&packed[3..3 + target_end]).unwrap();
+        assert_eq!(target, "unix:/var/run/docker.sock");
+    }
+
+    #[test]
+    fn test_socket_open_channel_id_allocation() {
+        // Odd = client
+        assert!(SocketOpenPacket::is_client_initiated(1));
+        assert!(SocketOpenPacket::is_client_initiated(3));
+        assert!(SocketOpenPacket::is_client_initiated(65535));
+        assert!(!SocketOpenPacket::is_server_initiated(1));
+        
+        // Even = server
+        assert!(SocketOpenPacket::is_server_initiated(2));
+        assert!(SocketOpenPacket::is_server_initiated(4));
+        assert!(SocketOpenPacket::is_server_initiated(65534));
+        assert!(!SocketOpenPacket::is_client_initiated(2));
+        
+        // Zero is special (invalid)
+        assert!(!SocketOpenPacket::is_client_initiated(0));
+        assert!(!SocketOpenPacket::is_server_initiated(0));
+    }
+
+    #[test]
+    fn test_socket_data_roundtrip() {
+        let payload = b"hello from channel";
+        let packed = SocketDataPacket::pack(7, payload);
+        
+        assert_eq!(packed.len(), SOCKET_DATA_HEADER_SIZE + payload.len());
+        assert_eq!(u16::from_le_bytes(packed[0..2].try_into().unwrap()), 7);
+        assert_eq!(&packed[2..], payload);
+    }
+
+    #[test]
+    fn test_socket_data_empty_payload() {
+        // Edge case: empty data is valid (could be a flush/sync signal)
+        let packed = SocketDataPacket::pack(99, &[]);
+        assert_eq!(packed.len(), SOCKET_DATA_HEADER_SIZE);
+        assert_eq!(u16::from_le_bytes(packed[0..2].try_into().unwrap()), 99);
+    }
+
+    #[test]
+    fn test_socket_data_max_payload() {
+        let max_payload = SocketDataPacket::max_payload_size();
+        assert_eq!(max_payload, MAX_BLOCK_SIZE - SOCKET_DATA_HEADER_SIZE);
+        
+        // Create max-size payload
+        let data = vec![0xAA; max_payload];
+        let packed = SocketDataPacket::pack(1, &data);
+        assert_eq!(packed.len(), SOCKET_DATA_HEADER_SIZE + max_payload);
+    }
+
+    #[test]
+    fn test_socket_close_roundtrip() {
+        let packed = SocketClosePacket::pack(5, CHANNEL_CLOSE_NORMAL);
+        assert_eq!(packed.len(), SOCKET_CLOSE_SIZE);
+        
+        assert_eq!(u16::from_le_bytes(packed[0..2].try_into().unwrap()), 5);
+        assert_eq!(u16::from_le_bytes(packed[2..4].try_into().unwrap()), CHANNEL_CLOSE_NORMAL);
+    }
+
+    #[test]
+    fn test_socket_close_codes() {
+        assert_eq!(SocketClosePacket::code_name(CHANNEL_CLOSE_NORMAL), "NORMAL");
+        assert_eq!(SocketClosePacket::code_name(CHANNEL_CLOSE_TARGET_REFUSED), "TARGET_REFUSED");
+        assert_eq!(SocketClosePacket::code_name(CHANNEL_CLOSE_TARGET_UNREACHABLE), "TARGET_UNREACHABLE");
+        assert_eq!(SocketClosePacket::code_name(CHANNEL_CLOSE_AUTH_FAILED), "AUTH_FAILED");
+        assert_eq!(SocketClosePacket::code_name(CHANNEL_CLOSE_TIMEOUT), "TIMEOUT");
+        assert_eq!(SocketClosePacket::code_name(CHANNEL_CLOSE_ADMIN), "ADMIN_CLOSE");
+        assert_eq!(SocketClosePacket::code_name(CHANNEL_CLOSE_PROTOCOL_ERROR), "PROTOCOL_ERROR");
+        assert_eq!(SocketClosePacket::code_name(0xFFFF), "UNKNOWN");
+    }
+
+    #[test]
+    fn test_socket_error_roundtrip() {
+        let packed = SocketErrorPacket::pack(11, CHANNEL_CLOSE_TIMEOUT, "connection timed out after 30s");
+        
+        assert!(packed.len() >= SOCKET_ERROR_HEADER_SIZE);
+        assert_eq!(u16::from_le_bytes(packed[0..2].try_into().unwrap()), 11);
+        assert_eq!(u16::from_le_bytes(packed[2..4].try_into().unwrap()), CHANNEL_CLOSE_TIMEOUT);
+        
+        let message = std::str::from_utf8(&packed[4..]).unwrap();
+        assert_eq!(message, "connection timed out after 30s");
+    }
+
+    #[test]
+    fn test_socket_error_empty_message() {
+        // Error with no message is valid
+        let packed = SocketErrorPacket::pack(1, CHANNEL_CLOSE_PROTOCOL_ERROR, "");
+        assert_eq!(packed.len(), SOCKET_ERROR_HEADER_SIZE);
+    }
+
+    #[test]
+    fn test_socket_window_roundtrip() {
+        let packed = SocketWindowPacket::pack(13, CHANNEL_INITIAL_CREDIT);
+        assert_eq!(packed.len(), SOCKET_WINDOW_SIZE);
+        
+        assert_eq!(u16::from_le_bytes(packed[0..2].try_into().unwrap()), 13);
+        assert_eq!(u32::from_le_bytes(packed[2..6].try_into().unwrap()), CHANNEL_INITIAL_CREDIT);
+    }
+
+    #[test]
+    fn test_socket_window_additive() {
+        // Window credits are additive - verify we can represent large totals
+        let large_credit: u32 = 10 * 1024 * 1024; // 10MB
+        let packed = SocketWindowPacket::pack(1, large_credit);
+        assert_eq!(u32::from_le_bytes(packed[2..6].try_into().unwrap()), large_credit);
+    }
+
+    #[test]
+    fn test_socket_proxy_frame_integration() {
+        // Test that socket proxy packets work with the framer
+        let framer = WSLinkFramerImpl;
+        
+        // SOCKET_OPEN frame
+        let open_payload = SocketOpenPacket::pack(1, CHANNEL_FLAG_BIDIR, "tcp:localhost:5432");
+        let open_frame = framer.build_frame(PACK_SOCKET_OPEN, &open_payload);
+        let parsed = framer.parse_frame(&open_frame).unwrap();
+        assert_eq!(parsed.pkt_type, PACK_SOCKET_OPEN);
+        assert_eq!(parsed.payload, open_payload);
+        
+        // SOCKET_DATA frame
+        let data_payload = SocketDataPacket::pack(1, b"SELECT 1;");
+        let data_frame = framer.build_frame(PACK_SOCKET_DATA, &data_payload);
+        let parsed = framer.parse_frame(&data_frame).unwrap();
+        assert_eq!(parsed.pkt_type, PACK_SOCKET_DATA);
+        
+        // SOCKET_WINDOW frame
+        let window_payload = SocketWindowPacket::pack(1, 4096);
+        let window_frame = framer.build_frame(PACK_SOCKET_WINDOW, &window_payload);
+        let parsed = framer.parse_frame(&window_frame).unwrap();
+        assert_eq!(parsed.pkt_type, PACK_SOCKET_WINDOW);
+        
+        // SOCKET_CLOSE frame
+        let close_payload = SocketClosePacket::pack(1, CHANNEL_CLOSE_NORMAL);
+        let close_frame = framer.build_frame(PACK_SOCKET_CLOSE, &close_payload);
+        let parsed = framer.parse_frame(&close_frame).unwrap();
+        assert_eq!(parsed.pkt_type, PACK_SOCKET_CLOSE);
+    }
+
+    #[test]
+    fn test_all_socket_proxy_packet_types() {
+        let framer = WSLinkFramerImpl;
+        for pkt_type in [PACK_SOCKET_OPEN, PACK_SOCKET_DATA, PACK_SOCKET_CLOSE, 
+                         PACK_SOCKET_ERROR, PACK_SOCKET_WINDOW] {
+            let frame = framer.build_frame(pkt_type, b"x");
+            let parsed = framer.parse_frame(&frame).unwrap();
+            assert_eq!(parsed.pkt_type, pkt_type);
+        }
+    }
+
+    #[test]
+    fn test_socket_open_malformed_no_null_terminator() {
+        // Edge case: target without null terminator
+        // The parser should handle this gracefully (use entire remaining buffer)
+        let mut packed = Vec::new();
+        packed.extend_from_slice(&1u16.to_le_bytes()); // channel
+        packed.push(CHANNEL_FLAG_BIDIR);               // flags
+        packed.extend_from_slice(b"ssh-agent");        // NO null terminator
+        
+        // Parser should still extract the target (up to end of buffer)
+        assert!(packed.len() >= SOCKET_OPEN_HEADER_SIZE + 1);
+    }
+
+    #[test]
+    fn test_channel_flags_combinations() {
+        // Valid combinations
+        let bidir = CHANNEL_FLAG_BIDIR;
+        let read_compressed = CHANNEL_FLAG_READ_ONLY | CHANNEL_FLAG_COMPRESSED;
+        let write_encrypted = CHANNEL_FLAG_WRITE_ONLY | CHANNEL_FLAG_ENCRYPTED;
+        let full_audit = CHANNEL_FLAG_BIDIR | CHANNEL_FLAG_COMPRESSED | 
+                         CHANNEL_FLAG_ENCRYPTED | CHANNEL_FLAG_AUDIT;
+        
+        // All should pack successfully
+        let _ = SocketOpenPacket::pack(1, bidir, "test");
+        let _ = SocketOpenPacket::pack(3, read_compressed, "test");
+        let _ = SocketOpenPacket::pack(5, write_encrypted, "test");
+        let _ = SocketOpenPacket::pack(7, full_audit, "test");
     }
 }

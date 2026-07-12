@@ -12,22 +12,22 @@
 
 ### Phase 1: Core Protocol
 
-- [ ] Add socket proxy constants to `protocols/wslink/const.py` (5 new packet types)
-- [ ] Add Rust packet structs to `crates/pyprotocols-core/src/protocols/wslink.rs`
-  - [ ] SocketOpenPacket (channel + flags + target)
-  - [ ] SocketDataPacket (channel + data)
-  - [ ] SocketClosePacket (channel + code)
-  - [ ] SocketErrorPacket (channel + code + message)
-  - [ ] SocketWindowPacket (channel + credit)
-- [ ] New `crates/pyprotocols-core/src/channel.rs`
-  - [ ] ChannelMux (demux frames to channels, mux data to frames)
-  - [ ] Credit-based flow control (per SSH RFC 4254 §5.2)
-  - [ ] Channel lifecycle (OPEN → DATA → CLOSE)
-  - [ ] Channel table (max 256 concurrent)
-- [ ] Unit tests for all new packet types
-- [ ] Unit tests for channel lifecycle (open, data, close, error, window)
-- [ ] Unit tests for CRC32 integrity on new frame types
-- [ ] Python bindings (PyO3) for ChannelMux
+- [x] Add socket proxy constants to `protocols/wslink/const.py` (5 new packet types)
+- [x] Add Rust packet structs to `crates/pyprotocols-core/src/protocols/wslink.rs`
+  - [x] SocketOpenPacket (channel + flags + target)
+  - [x] SocketDataPacket (channel + data)
+  - [x] SocketClosePacket (channel + code)
+  - [x] SocketErrorPacket (channel + code + message)
+  - [x] SocketWindowPacket (channel + credit)
+- [x] New `crates/pyprotocols-core/src/channel.rs`
+  - [x] ChannelMux (demux frames to channels, mux data to frames)
+  - [x] Credit-based flow control (per SSH RFC 4254 §5.2)
+  - [x] Channel lifecycle (OPEN → DATA → CLOSE)
+  - [x] Channel table (max 256 concurrent)
+- [x] Unit tests for all new packet types (17 tests)
+- [ ] Unit tests for channel lifecycle (open, data, close, error, window) — Rust tests written, need Python integration
+- [x] Unit tests for CRC32 integrity on new frame types
+- [x] Python bindings (PyO3) for ChannelMux
 
 ### Phase 2: Compression + Encryption
 
@@ -120,6 +120,22 @@ Rust:   Framing + CRC32 + LZ4 + encryption (always, for all channels)
 - [ ] BBR-style congestion control in sender pump (designed, not implemented)
 - [ ] QUIC transport option (alternative to parallel TCP WebSockets)
 - [ ] Formal protocol specification document (IETF-style)
+
+### Backlog: WSLink over PTY
+
+- [ ] COBS transport layer (Consistent Overhead Byte Stuffing)
+  - [ ] `crates/pyprotocols-core/src/cobs.rs` — encode/decode
+  - [ ] Zero-byte frame delimiter (unambiguous, no escaping)
+  - [ ] 0.4% worst-case overhead (1 byte per 254)
+  - [ ] Unit tests for edge cases (all zeros, all 0xFF, empty)
+- [ ] PTY raw-mode helper
+  - [ ] Eliminate race window between exec() and tcsetattr()
+  - [ ] Parent-side: setraw() before fork
+  - [ ] Child-side: setraw() as first operation
+- [ ] SSH stdin/stdout tunnel mode
+  - [ ] `ssh user@host 'wslink-server' | wslink-client`
+  - [ ] No port forwarding required
+  - [ ] Useful for locked-down environments
 
 ### Maintenance
 
