@@ -3,6 +3,12 @@
 Implements:
 - LZ4 compression (fast, ~400MB/s compress, ~2GB/s decompress)
 - ChaCha20-Poly1305 AEAD encryption (fast on CPUs without AES-NI)
+- AES-256-GCM AEAD encryption (CNSA 1.0/2.0 compliant, fast with AES-NI)
+
+Cipher Suite Support:
+- CHACHA20_POLY1305: Default, excellent performance on all CPUs
+- AES_256_GCM: NSA CNSA Suite approved, uses hardware AES-NI when available
+- AES_256_GCM_SIV: Nonce-misuse resistant variant (future)
 
 Each channel can independently enable compression and/or encryption via flags.
 Transforms are applied in order: compress → encrypt (on send), decrypt → decompress (on recv).
@@ -14,6 +20,7 @@ import os
 import struct
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Optional, Tuple
 
 # Optional dependencies - graceful fallback
@@ -24,10 +31,23 @@ except ImportError:
     HAS_LZ4 = False
 
 try:
-    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305, AESGCM
     HAS_CRYPTO = True
 except ImportError:
     HAS_CRYPTO = False
+
+
+class CipherSuite(Enum):
+    """Supported cipher suites for channel encryption."""
+    
+    NONE = auto()               # Raw/unencrypted - explicit rawdog mode
+    CHACHA20_POLY1305 = auto()  # Default: fast on all CPUs
+    AES_256_GCM = auto()        # CNSA 1.0/2.0: fast with AES-NI hardware
+    # Future: AES_256_GCM_SIV for nonce-misuse resistance
+
+
+# Alias for clarity
+RAW = CipherSuite.NONE
 
 
 class TransformError(Exception):
@@ -190,6 +210,68 @@ class ChaCha20Transform(Transform):
             raise TransformError(f"Decryption failed: {e}")
 
 
+class AES256GCMTransform(Transform):
+    """AES-256-GCM AEAD encryption (CNSA Suite compliant).
+    
+    NSA CNSA 1.0 and 2.0 approved cipher. Uses hardware AES-NI
+    acceleration when available (most modern x86/ARM CPUs).
+    
+    Provides:
+    - Confidentiality (AES-256 in GCM mode)
+    - Integrity (GHASH-based authentication tag)
+    - Authentication of associated data (channel ID)
+    
+    Wire format: [12-byte nonce][ciphertext][16-byte tag]
+    
+    Performance notes:
+    - With AES-NI: ~5-10 GB/s (faster than ChaCha20)
+    - Without AES-NI: ~200-400 MB/s (slower than ChaCha20)
+    """
+    
+    TAG_SIZE = 16
+    NONCE_SIZE = 12  # 96-bit nonce per NIST SP 800-38D
+    KEY_SIZE = 32    # 256-bit key for CNSA compliance
+    
+    def __init__(self, key: bytes, channel_id: int):
+        """
+        Args:
+            key: 32-byte encryption key
+            channel_id: Channel ID for associated data
+        """
+        if not HAS_CRYPTO:
+            raise TransformError(
+                "cryptography package not installed: pip install cryptography"
+            )
+        if len(key) != self.KEY_SIZE:
+            raise ValueError(f"Key must be {self.KEY_SIZE} bytes, got {len(key)}")
+        
+        self._cipher = AESGCM(key)
+        self._key_state = EncryptionKey(key=key)
+        self._channel_id = channel_id
+        # Associated data: channel ID as 2-byte LE
+        self._aad = struct.pack("<H", channel_id)
+    
+    def encode(self, data: bytes) -> bytes:
+        """Encrypt data with AES-256-GCM."""
+        nonce = self._key_state.next_nonce()
+        ciphertext = self._cipher.encrypt(nonce, data, self._aad)
+        # Wire format: nonce + ciphertext (includes tag)
+        return nonce + ciphertext
+    
+    def decode(self, data: bytes) -> bytes:
+        """Decrypt AES-256-GCM data."""
+        if len(data) < self.NONCE_SIZE + self.TAG_SIZE:
+            raise TransformError("Encrypted data too short")
+        
+        nonce = data[:self.NONCE_SIZE]
+        ciphertext = data[self.NONCE_SIZE:]
+        
+        try:
+            return self._cipher.decrypt(nonce, ciphertext, self._aad)
+        except Exception as e:
+            raise TransformError(f"Decryption failed: {e}")
+
+
 class CompositeTransform(Transform):
     """Chain multiple transforms together.
     
@@ -218,6 +300,7 @@ def derive_channel_key(
     master_key: bytes,
     channel_id: int,
     is_client: bool,
+    use_sha384: bool = False,
 ) -> bytes:
     """Derive a unique encryption key for a channel.
     
@@ -229,6 +312,7 @@ def derive_channel_key(
         master_key: Shared master key (32 bytes recommended)
         channel_id: Channel ID
         is_client: True for client→server, False for server→client
+        use_sha384: Use SHA-384 for CNSA compliance (default: SHA-256)
     
     Returns:
         32-byte derived key for this channel
@@ -243,8 +327,11 @@ def derive_channel_key(
     direction = b"c2s" if is_client else b"s2c"
     info = b"wslink-channel-" + struct.pack("<H", channel_id) + b"-" + direction
     
+    # CNSA requires SHA-384 minimum
+    algorithm = hashes.SHA384() if use_sha384 else hashes.SHA256()
+    
     hkdf = HKDF(
-        algorithm=hashes.SHA256(),
+        algorithm=algorithm,
         length=32,
         salt=None,  # Could add salt for extra security
         info=info,
@@ -252,11 +339,40 @@ def derive_channel_key(
     return hkdf.derive(master_key)
 
 
+def create_encryption_transform(
+    cipher_suite: CipherSuite,
+    key: bytes,
+    channel_id: int,
+) -> Transform:
+    """Create an encryption transform for the specified cipher suite.
+    
+    Args:
+        cipher_suite: Which cipher to use
+        key: 32-byte encryption key
+        channel_id: Channel ID (used as AAD)
+    
+    Returns:
+        Configured encryption Transform
+    
+    Raises:
+        TransformError: If cipher suite not supported or deps missing
+    """
+    if cipher_suite == CipherSuite.NONE:
+        return IdentityTransform()
+    elif cipher_suite == CipherSuite.CHACHA20_POLY1305:
+        return ChaCha20Transform(key, channel_id)
+    elif cipher_suite == CipherSuite.AES_256_GCM:
+        return AES256GCMTransform(key, channel_id)
+    else:
+        raise TransformError(f"Unsupported cipher suite: {cipher_suite}")
+
+
 def create_channel_transform(
     flags: int,
     encryption_key: Optional[bytes] = None,
     channel_id: int = 0,
     compression_level: int = 0,
+    cipher_suite: CipherSuite = CipherSuite.CHACHA20_POLY1305,
 ) -> Transform:
     """Create the appropriate transform for a channel based on its flags.
     
@@ -265,6 +381,7 @@ def create_channel_transform(
         encryption_key: 32-byte key for encryption (required if encrypted)
         channel_id: Channel ID (used as AAD for encryption)
         compression_level: LZ4 compression level (0-16)
+        cipher_suite: Which cipher to use (default: ChaCha20-Poly1305)
     
     Returns:
         Configured Transform instance
@@ -281,11 +398,14 @@ def create_channel_transform(
     
     # Then encryption
     if flags & CHANNEL_FLAG_ENCRYPTED:
-        if not HAS_CRYPTO:
+        if cipher_suite == CipherSuite.NONE:
+            pass  # Explicit rawdog - no encryption even if flag set
+        elif not HAS_CRYPTO:
             raise TransformError("Encryption requested but cryptography not installed")
-        if not encryption_key:
+        elif not encryption_key:
             raise TransformError("Encryption requested but no key provided")
-        transforms.append(ChaCha20Transform(encryption_key, channel_id))
+        else:
+            transforms.append(create_encryption_transform(cipher_suite, encryption_key, channel_id))
     
     if not transforms:
         return IdentityTransform()
@@ -307,5 +427,74 @@ def encryption_available() -> bool:
 
 
 def generate_key() -> bytes:
-    """Generate a random 32-byte key for ChaCha20."""
+    """Generate a random 32-byte key for encryption."""
     return os.urandom(32)
+
+
+def cipher_suite_info(suite: CipherSuite) -> dict:
+    """Return metadata about a cipher suite.
+    
+    Returns:
+        Dict with name, cnsa_approved, key_size, nonce_size, tag_size
+    """
+    info = {
+        CipherSuite.NONE: {
+            "name": "None (raw)",
+            "cnsa_approved": False,
+            "key_size": 0,
+            "nonce_size": 0,
+            "tag_size": 0,
+            "description": "No encryption - raw data passthrough",
+        },
+        CipherSuite.CHACHA20_POLY1305: {
+            "name": "ChaCha20-Poly1305",
+            "cnsa_approved": False,
+            "key_size": 32,
+            "nonce_size": 12,
+            "tag_size": 16,
+            "description": "IETF RFC 8439 - fast on all CPUs",
+        },
+        CipherSuite.AES_256_GCM: {
+            "name": "AES-256-GCM",
+            "cnsa_approved": True,
+            "key_size": 32,
+            "nonce_size": 12,
+            "tag_size": 16,
+            "description": "NIST SP 800-38D - CNSA 1.0/2.0 approved",
+        },
+    }
+    return info.get(suite, {"name": "Unknown", "cnsa_approved": False})
+
+
+def has_aes_ni() -> bool:
+    """Check if CPU has AES-NI hardware acceleration.
+    
+    AES-NI provides ~10x speedup for AES-GCM operations.
+    Returns True if likely available (not guaranteed).
+    """
+    try:
+        # Check /proc/cpuinfo on Linux
+        with open("/proc/cpuinfo", "r") as f:
+            return "aes" in f.read().lower()
+    except (IOError, OSError):
+        pass
+    
+    # Fallback: assume modern x86_64 has it
+    import platform
+    return platform.machine() in ("x86_64", "AMD64", "aarch64")
+
+
+def recommended_cipher_suite() -> CipherSuite:
+    """Return the recommended cipher suite for this system.
+    
+    Uses AES-256-GCM if AES-NI is available (faster),
+    otherwise ChaCha20-Poly1305 (consistent performance).
+    """
+    if has_aes_ni():
+        return CipherSuite.AES_256_GCM
+    return CipherSuite.CHACHA20_POLY1305
+
+
+def cnsa_cipher_suite() -> CipherSuite:
+    """Return the CNSA-compliant cipher suite (AES-256-GCM)."""
+    return CipherSuite.AES_256_GCM
