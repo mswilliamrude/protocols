@@ -15,6 +15,19 @@ from .handlers import (
     DEFAULT_POLICY,
 )
 from .proxy import SocketProxy, ProxyStats, create_proxy
+from .transforms import (
+    Transform,
+    IdentityTransform,
+    LZ4Transform,
+    ChaCha20Transform,
+    CompositeTransform,
+    TransformError,
+    create_channel_transform,
+    derive_channel_key,
+    compression_available,
+    encryption_available,
+    generate_key,
+)
 from .const import (
     # Packet types
     PACK_SOCKET_OPEN,
@@ -67,6 +80,18 @@ __all__ = [
     "SocketProxy",
     "ProxyStats",
     "create_proxy",
+    # Transforms (compression/encryption)
+    "Transform",
+    "IdentityTransform",
+    "LZ4Transform",
+    "ChaCha20Transform",
+    "CompositeTransform",
+    "TransformError",
+    "create_channel_transform",
+    "derive_channel_key",
+    "compression_available",
+    "encryption_available",
+    "generate_key",
     # Packet types
     "PACK_SOCKET_OPEN",
     "PACK_SOCKET_DATA",
