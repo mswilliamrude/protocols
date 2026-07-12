@@ -139,13 +139,11 @@ class SocketProxy:
             self._stats.policy_denials += 1
             raise PermissionError(f"Target denied by policy: {target}")
         
-        # Create channel in mux
-        packet = self._mux.open_channel(target, flags)
-        if packet is None:
+        # Create channel in mux - returns (channel_id, packet)
+        try:
+            channel_id, packet = self._mux.open_channel(target, flags)
+        except ValueError:
             raise RuntimeError("Max channels reached")
-        
-        # Extract channel ID from packet (bytes 0:2)
-        channel_id = struct.unpack("<H", packet[:2])[0]
         
         # Send OPEN packet
         self._send(self._frame_packet(PACK_SOCKET_OPEN, packet))
@@ -228,11 +226,12 @@ class SocketProxy:
             await self._send_error(channel_id, CHANNEL_CLOSE_TARGET_REFUSED, "Denied by policy")
             return
         
-        # Accept the channel in mux
-        result = self._mux.handle_open(channel_id, target, flags)
-        if result is None:
-            log.warning(f"Mux rejected channel {channel_id}")
-            await self._send_error(channel_id, CHANNEL_CLOSE_PROTOCOL_ERROR, "Channel rejected")
+        # Accept the channel in mux - handle_open(channel_id, flags, target)
+        try:
+            result = self._mux.handle_open(channel_id, flags, target)
+        except ValueError as e:
+            log.warning(f"Mux rejected channel {channel_id}: {e}")
+            await self._send_error(channel_id, CHANNEL_CLOSE_PROTOCOL_ERROR, str(e))
             return
         
         # Create handler and connect to target
@@ -244,13 +243,15 @@ class SocketProxy:
             self._stats.connect_failures += 1
             log.error(f"Failed to connect to {target}: {e}")
             await self._send_error(channel_id, CHANNEL_CLOSE_TARGET_UNREACHABLE, str(e))
-            self._mux.close_channel(channel_id, CHANNEL_CLOSE_TARGET_UNREACHABLE)
+            try:
+                self._mux.close_channel(channel_id, CHANNEL_CLOSE_TARGET_UNREACHABLE)
+            except ValueError:
+                pass  # Channel might not be registered yet
             return
         
-        # Send WINDOW to confirm channel is open
-        window_packet = self._mux.send_window_update(channel_id, CHANNEL_INITIAL_CREDIT)
-        if window_packet:
-            self._send(self._frame_packet(PACK_SOCKET_WINDOW, window_packet))
+        # Send WINDOW to confirm channel is open - grant_window returns packet bytes
+        window_packet = self._mux.grant_window(channel_id, CHANNEL_INITIAL_CREDIT)
+        self._send(self._frame_packet(PACK_SOCKET_WINDOW, window_packet))
         
         # Start data pump task
         self._pump_tasks[channel_id] = asyncio.create_task(
@@ -266,15 +267,16 @@ class SocketProxy:
         channel_id = struct.unpack("<H", payload[:2])[0]
         data = payload[2:]
         
-        # Update mux flow control
-        result = self._mux.handle_data(channel_id, data)
-        if result is None:
-            log.warning(f"Data rejected for channel {channel_id}")
+        # Update mux flow control - returns (data, should_send_window)
+        try:
+            _, should_send_window = self._mux.handle_data(channel_id, data)
+        except ValueError as e:
+            log.warning(f"Data rejected for channel {channel_id}: {e}")
             return
         
-        # Check if we need to send window update
-        window_packet = self._mux.send_window_update(channel_id, 0)  # 0 = auto-calculate
-        if window_packet:
+        # Send window update if needed (refill to initial credit)
+        if should_send_window:
+            window_packet = self._mux.grant_window(channel_id, CHANNEL_INITIAL_CREDIT)
             self._send(self._frame_packet(PACK_SOCKET_WINDOW, window_packet))
         
         # Forward to target
@@ -293,7 +295,13 @@ class SocketProxy:
         
         log.debug(f"Received CLOSE for channel {channel_id} (code={code})")
         
-        self._mux.handle_peer_close(channel_id, code)
+        try:
+            should_send_back, close_packet = self._mux.handle_close(channel_id, code)
+            if should_send_back and close_packet:
+                self._send(self._frame_packet(PACK_SOCKET_CLOSE, close_packet))
+        except ValueError:
+            pass  # Channel already closed or unknown
+        
         await self._cleanup_channel(channel_id)
         self._stats.channels_closed += 1
     
@@ -355,10 +363,13 @@ class SocketProxy:
             await self.close_channel(channel_id, CHANNEL_CLOSE_TARGET_UNREACHABLE)
     
     async def _send_error(self, channel_id: int, code: int, message: str) -> None:
-        """Send an error packet."""
-        packet = self._mux.send_error(channel_id, code, message)
-        if packet:
-            self._send(self._frame_packet(PACK_SOCKET_ERROR, packet))
+        """Send an error packet.
+        
+        Can be called even for channels not registered in mux (e.g., policy denial).
+        """
+        msg_bytes = message.encode("utf-8")[:256]  # Limit message length
+        packet = struct.pack("<HHH", channel_id, code, len(msg_bytes)) + msg_bytes
+        self._send(self._frame_packet(PACK_SOCKET_ERROR, packet))
     
     async def _cleanup_channel(self, channel_id: int) -> None:
         """Clean up channel resources."""
@@ -383,11 +394,17 @@ class SocketProxy:
         """
         import zlib
         
+        # Ensure packet_type is bytes (could be int or bytes)
+        if isinstance(packet_type, int):
+            type_byte = bytes([packet_type])
+        else:
+            type_byte = packet_type  # Already bytes (e.g., b's')
+        
         # Length includes type + payload (not length itself or CRC)
-        length = 1 + len(payload)
+        length = len(type_byte) + len(payload)
         
         # Build packet
-        packet = struct.pack("<I", length) + bytes([packet_type]) + payload
+        packet = struct.pack("<I", length) + type_byte + payload
         
         # Add CRC32
         crc = zlib.crc32(packet) & 0xFFFFFFFF
