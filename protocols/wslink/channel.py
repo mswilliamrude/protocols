@@ -2,6 +2,12 @@
 
 For data plane ≤400 Mbps (SSH agent, serial, DNS, USB 2.0).
 Rust ChannelMux preferred for >400 Mbps workloads.
+
+Security features:
+- Credit bounds checking prevents memory exhaustion
+- Flow control enforcement rejects over-credit data
+- Channel ID collision detection on wraparound
+- State machine validation on all operations
 """
 
 from __future__ import annotations
@@ -9,7 +15,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 from .const import (
     CHANNEL_MAX_CONCURRENT,
@@ -29,6 +35,22 @@ from .const import (
 )
 
 
+# Security constants
+CHANNEL_MAX_CREDIT = 2**32  # Maximum credit value (4GB)
+MAX_TARGET_LENGTH = 4096  # Maximum target string length
+MAX_ERROR_MSG_LENGTH = 65535  # Maximum error message length
+
+
+class ChannelError(Exception):
+    """Channel protocol error."""
+    pass
+
+
+class FlowControlViolation(ChannelError):
+    """Peer violated flow control rules."""
+    pass
+
+
 class ChannelState(Enum):
     """State machine for a single channel."""
     OPENING = "opening"
@@ -40,7 +62,13 @@ class ChannelState(Enum):
 
 @dataclass
 class Channel:
-    """A single channel within a multiplexed session."""
+    """A single channel within a multiplexed session.
+    
+    Security features:
+    - Credit bounds prevent memory exhaustion attacks
+    - State validation on all operations
+    - Flow control tracking for violation detection
+    """
     id: int
     target: str
     flags: int
@@ -63,19 +91,53 @@ class Channel:
         self.bytes_sent += length
 
     def add_send_credit(self, credit: int) -> None:
-        """Add to send credit (when peer sends WINDOW)."""
-        self.send_credit += credit
+        """Add to send credit (when peer sends WINDOW).
+        
+        Raises:
+            FlowControlViolation: If credit would exceed maximum bounds
+        """
+        if credit < 0:
+            raise FlowControlViolation(f"negative credit value: {credit}")
+        
+        new_credit = self.send_credit + credit
+        if new_credit > CHANNEL_MAX_CREDIT:
+            raise FlowControlViolation(
+                f"credit overflow: {self.send_credit} + {credit} > {CHANNEL_MAX_CREDIT}"
+            )
+        
+        self.send_credit = new_credit
         if self.state == ChannelState.OPENING:
             self.state = ChannelState.OPEN
 
-    def consume_recv_credit(self, length: int) -> None:
-        """Consume recv credit when receiving data."""
-        self.recv_credit = max(0, self.recv_credit - length)
+    def consume_recv_credit(self, length: int) -> bool:
+        """Consume recv credit when receiving data.
+        
+        Returns:
+            True if credit was available, False if flow control violated
+        """
+        if length > self.recv_credit:
+            # Flow control violation - peer sent more than allowed
+            return False
+        self.recv_credit -= length
         self.bytes_recv += length
+        return True
 
     def add_recv_credit(self, credit: int) -> None:
-        """Add to recv credit (when we send WINDOW)."""
-        self.recv_credit += credit
+        """Add to recv credit (when we send WINDOW).
+        
+        Raises:
+            FlowControlViolation: If credit would exceed maximum bounds
+        """
+        if credit < 0:
+            raise FlowControlViolation(f"negative credit value: {credit}")
+        
+        new_credit = self.recv_credit + credit
+        if new_credit > CHANNEL_MAX_CREDIT:
+            raise FlowControlViolation(
+                f"credit overflow: {self.recv_credit} + {credit} > {CHANNEL_MAX_CREDIT}"
+            )
+        
+        self.recv_credit = new_credit
 
     def needs_window_update(self) -> bool:
         """Check if we should send a WINDOW update (low recv credit)."""
@@ -115,6 +177,12 @@ class ChannelMux:
     """Multiplexer managing multiple channels over a WSLink session.
     
     Pure Python implementation — use Rust ChannelMux for >400 Mbps.
+    
+    Security features:
+    - Channel ID collision detection on wraparound
+    - Flow control enforcement (rejects over-credit data)
+    - Credit bounds validation
+    - Target string length limits
     """
 
     def __init__(self, is_client: bool = True, max_channels: int = 256):
@@ -125,27 +193,28 @@ class ChannelMux:
         self.max_channels = min(max_channels, CHANNEL_MAX_CONCURRENT)
         self.total_opened = 0
         self.total_closed = 0
+        # Track IDs that have been used but not yet recycled
+        self._used_ids: Set[int] = set()
+        # Flow control violations counter for monitoring
+        self.flow_violations = 0
 
     def open_channel(self, target: str, flags: int = 0) -> Tuple[int, bytes]:
         """Open a new channel to a target.
         
         Returns: (channel_id, open_packet_bytes)
-        Raises: ValueError if max channels reached
+        Raises: 
+            ValueError: If max channels reached
+            ChannelError: If no free channel IDs available (wraparound collision)
         """
         if len(self.channels) >= self.max_channels:
             raise ValueError(f"max channels ({self.max_channels}) reached")
 
-        # Allocate next ID for our side
-        if self.is_client:
-            channel_id = self._next_client_id
-            self._next_client_id += 2
-            if self._next_client_id > 0xFFFF:
-                self._next_client_id = 1
-        else:
-            channel_id = self._next_server_id
-            self._next_server_id += 2
-            if self._next_server_id > 0xFFFF:
-                self._next_server_id = 2
+        # Validate target length
+        if len(target) > MAX_TARGET_LENGTH:
+            raise ValueError(f"target too long: {len(target)} > {MAX_TARGET_LENGTH}")
+
+        # Allocate next ID for our side with collision detection
+        channel_id = self._allocate_channel_id()
 
         channel = Channel(
             id=channel_id,
@@ -155,17 +224,66 @@ class ChannelMux:
             is_initiator=True,
         )
         self.channels[channel_id] = channel
+        self._used_ids.add(channel_id)
         self.total_opened += 1
 
         # Pack OPEN: channel_id (2) + flags (1) + target (N)
         packet = struct.pack("<HB", channel_id, flags) + target.encode("utf-8")
         return channel_id, packet
 
+    def _allocate_channel_id(self) -> int:
+        """Allocate a free channel ID with collision detection.
+        
+        Raises:
+            ChannelError: If no free IDs available after full scan
+        """
+        if self.is_client:
+            start_id = self._next_client_id
+            step = 2
+            max_id = 0xFFFF
+            wrap_id = 1
+        else:
+            start_id = self._next_server_id
+            step = 2
+            max_id = 0xFFFF
+            wrap_id = 2
+
+        # Try to find a free ID, scanning up to 32K possibilities
+        candidate = start_id
+        checked = 0
+        max_checks = 32768  # Maximum possible IDs per side
+        
+        while checked < max_checks:
+            if candidate not in self.channels and candidate not in self._used_ids:
+                # Found a free ID
+                next_id = candidate + step
+                if next_id > max_id:
+                    next_id = wrap_id
+                
+                if self.is_client:
+                    self._next_client_id = next_id
+                else:
+                    self._next_server_id = next_id
+                
+                return candidate
+            
+            # Try next ID
+            candidate += step
+            if candidate > max_id:
+                candidate = wrap_id
+            checked += 1
+        
+        raise ChannelError("no free channel IDs available (all 32K in use or reserved)")
+
     def handle_open(self, channel_id: int, flags: int, target: str) -> Tuple[int, bytes]:
         """Handle an incoming SOCKET_OPEN from peer.
         
         Returns: (channel_id, window_packet_bytes) to send back
         """
+        # Validate target length
+        if len(target) > MAX_TARGET_LENGTH:
+            raise ValueError(f"target too long: {len(target)} > {MAX_TARGET_LENGTH}")
+
         # Validate channel ID parity
         is_peer_initiated = (
             (channel_id % 2 == 0) if self.is_client else (channel_id % 2 == 1)
@@ -187,6 +305,7 @@ class ChannelMux:
             is_initiator=False,
         )
         self.channels[channel_id] = channel
+        self._used_ids.add(channel_id)
         self.total_opened += 1
 
         # Send initial WINDOW
@@ -216,6 +335,9 @@ class ChannelMux:
         """Handle incoming data on a channel.
         
         Returns: (data, should_send_window)
+        
+        Raises:
+            FlowControlViolation: If peer exceeded their credit allowance
         """
         channel = self.channels.get(channel_id)
         if channel is None:
@@ -226,14 +348,27 @@ class ChannelMux:
                 f"received data on non-open channel {channel_id} (state: {channel.state.value})"
             )
 
-        channel.consume_recv_credit(len(data))
+        # Enforce flow control - peer cannot send more than their credit
+        if not channel.consume_recv_credit(len(data)):
+            self.flow_violations += 1
+            raise FlowControlViolation(
+                f"channel {channel_id}: peer sent {len(data)} bytes but only has "
+                f"{channel.recv_credit} credit remaining"
+            )
+        
         return data, channel.needs_window_update()
 
     def handle_window(self, channel_id: int, credit: int) -> None:
-        """Handle incoming WINDOW update."""
+        """Handle incoming WINDOW update.
+        
+        Raises:
+            FlowControlViolation: If credit value invalid or would overflow
+        """
         channel = self.channels.get(channel_id)
         if channel is None:
             raise ValueError(f"unknown channel {channel_id}")
+        
+        # add_send_credit validates bounds and raises FlowControlViolation if needed
         channel.add_send_credit(credit)
 
     def grant_window(self, channel_id: int, credit: int) -> bytes:
@@ -270,8 +405,15 @@ class ChannelMux:
         return False, None
 
     def remove_channel(self, channel_id: int) -> bool:
-        """Remove a closed channel from the mux."""
-        return self.channels.pop(channel_id, None) is not None
+        """Remove a closed channel from the mux.
+        
+        Frees the channel ID for potential reuse after wraparound.
+        """
+        removed = self.channels.pop(channel_id, None) is not None
+        if removed:
+            # Allow ID reuse after channel is fully removed
+            self._used_ids.discard(channel_id)
+        return removed
 
     def handle_error(self, channel_id: int, code: int, message: str) -> None:
         """Handle incoming ERROR notification."""
@@ -279,13 +421,15 @@ class ChannelMux:
         if channel is None:
             raise ValueError(f"unknown channel {channel_id}")
         channel.last_error = code
-        channel.last_error_msg = message
+        # Truncate message to prevent memory exhaustion
+        channel.last_error_msg = message[:MAX_ERROR_MSG_LENGTH]
 
     def send_error(self, channel_id: int, code: int, message: str) -> bytes:
         """Send an error notification on a channel."""
         if channel_id not in self.channels:
             raise ValueError(f"unknown channel {channel_id}")
-        msg_bytes = message.encode("utf-8")
+        # Truncate message to limit
+        msg_bytes = message[:MAX_ERROR_MSG_LENGTH].encode("utf-8")
         return struct.pack("<HHH", channel_id, code, len(msg_bytes)) + msg_bytes
 
     def get_channel(self, channel_id: int) -> Optional[dict]:

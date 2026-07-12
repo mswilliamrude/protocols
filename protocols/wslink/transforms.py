@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import os
 import struct
+import threading
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional, Tuple
 
@@ -121,7 +122,10 @@ class LZ4Transform(Transform):
             return b'\x00' + data
     
     def decode(self, data: bytes) -> bytes:
-        """Decompress LZ4 data."""
+        """Decompress LZ4 data.
+        
+        Security: Limits decompressed size to prevent decompression bombs.
+        """
         if not data:
             return data
         
@@ -132,27 +136,62 @@ class LZ4Transform(Transform):
             # Uncompressed
             return payload
         elif flag == 0x01:
-            # LZ4 compressed
-            return lz4.frame.decompress(payload)
+            # LZ4 compressed - with decompression bomb protection
+            try:
+                # Try with max_output_size (newer lz4 versions)
+                return lz4.frame.decompress(payload, max_output_size=MAX_DECOMPRESSED_SIZE)
+            except TypeError:
+                # Fallback for older lz4 versions without max_output_size
+                result = lz4.frame.decompress(payload)
+                if len(result) > MAX_DECOMPRESSED_SIZE:
+                    raise TransformError(
+                        f"Decompressed size {len(result)} exceeds limit {MAX_DECOMPRESSED_SIZE}"
+                    )
+                return result
         else:
             raise TransformError(f"Unknown compression flag: {flag}")
 
 
+# Security constants
+MAX_NONCE_COUNTER = 2**32  # Conservative limit per NIST SP 800-38D for GCM
+MIN_MASTER_KEY_LENGTH = 16  # Minimum 128 bits
+RECOMMENDED_MASTER_KEY_LENGTH = 32  # 256 bits recommended
+MAX_MESSAGE_SIZE = 64 * 1024 * 1024  # 64MB max message
+MAX_DECOMPRESSED_SIZE = 256 * 1024 * 1024  # 256MB decompression limit
+
+
 @dataclass
 class EncryptionKey:
-    """Encryption key material for a channel."""
-    key: bytes  # 32 bytes for ChaCha20
+    """Encryption key material for a channel.
+    
+    Security features:
+    - Session-unique prefix prevents nonce reuse across sessions
+    - Thread-safe nonce generation via lock
+    - Counter overflow detection with rekey requirement
+    """
+    key: bytes  # 32 bytes for ChaCha20/AES-256
     nonce_counter: int = 0  # 64-bit counter for nonce generation
+    session_id: bytes = field(default_factory=lambda: os.urandom(4))  # Session-unique prefix
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     
     def next_nonce(self) -> bytes:
-        """Generate the next unique nonce (12 bytes).
+        """Generate the next unique nonce (12 bytes), thread-safe.
         
-        Format: [8-byte counter][4-byte random]
-        The counter ensures uniqueness; random bytes add unpredictability.
+        Format: [4-byte session_id][8-byte counter]
+        - session_id: Random per EncryptionKey instance, prevents cross-session reuse
+        - counter: Monotonic, prevents intra-session reuse
+        
+        Raises:
+            TransformError: If nonce space is exhausted (requires rekeying)
         """
-        nonce = struct.pack("<Q", self.nonce_counter) + os.urandom(4)
-        self.nonce_counter += 1
-        return nonce
+        with self._lock:
+            if self.nonce_counter >= MAX_NONCE_COUNTER:
+                raise TransformError(
+                    f"Nonce counter exhausted ({self.nonce_counter} >= {MAX_NONCE_COUNTER}) - rekey required"
+                )
+            nonce = self.session_id + struct.pack("<Q", self.nonce_counter)
+            self.nonce_counter += 1
+            return nonce
 
 
 class ChaCha20Transform(Transform):
@@ -164,6 +203,12 @@ class ChaCha20Transform(Transform):
     - Authentication of associated data (channel ID)
     
     Wire format: [12-byte nonce][ciphertext][16-byte tag]
+    
+    Security features:
+    - Session-unique nonces prevent cross-session reuse
+    - Thread-safe nonce generation
+    - Message size limits prevent memory exhaustion
+    - Sanitized error messages prevent information leakage
     """
     
     TAG_SIZE = 16
@@ -191,6 +236,8 @@ class ChaCha20Transform(Transform):
     
     def encode(self, data: bytes) -> bytes:
         """Encrypt data with ChaCha20-Poly1305."""
+        if len(data) > MAX_MESSAGE_SIZE:
+            raise TransformError(f"Message too large: {len(data)} > {MAX_MESSAGE_SIZE}")
         nonce = self._key_state.next_nonce()
         ciphertext = self._cipher.encrypt(nonce, data, self._aad)
         # Wire format: nonce + ciphertext (includes tag)
@@ -200,14 +247,17 @@ class ChaCha20Transform(Transform):
         """Decrypt ChaCha20-Poly1305 data."""
         if len(data) < self.NONCE_SIZE + self.TAG_SIZE:
             raise TransformError("Encrypted data too short")
+        if len(data) > MAX_MESSAGE_SIZE + self.NONCE_SIZE + self.TAG_SIZE:
+            raise TransformError("Encrypted data too large")
         
         nonce = data[:self.NONCE_SIZE]
         ciphertext = data[self.NONCE_SIZE:]
         
         try:
             return self._cipher.decrypt(nonce, ciphertext, self._aad)
-        except Exception as e:
-            raise TransformError(f"Decryption failed: {e}")
+        except Exception:
+            # Sanitize error - don't leak crypto internals
+            raise TransformError("Decryption failed") from None
 
 
 class AES256GCMTransform(Transform):
@@ -222,6 +272,12 @@ class AES256GCMTransform(Transform):
     - Authentication of associated data (channel ID)
     
     Wire format: [12-byte nonce][ciphertext][16-byte tag]
+    
+    Security features:
+    - Session-unique nonces prevent cross-session reuse
+    - Thread-safe nonce generation
+    - Message size limits prevent memory exhaustion
+    - Sanitized error messages prevent information leakage
     
     Performance notes:
     - With AES-NI: ~5-10 GB/s (faster than ChaCha20)
@@ -253,6 +309,8 @@ class AES256GCMTransform(Transform):
     
     def encode(self, data: bytes) -> bytes:
         """Encrypt data with AES-256-GCM."""
+        if len(data) > MAX_MESSAGE_SIZE:
+            raise TransformError(f"Message too large: {len(data)} > {MAX_MESSAGE_SIZE}")
         nonce = self._key_state.next_nonce()
         ciphertext = self._cipher.encrypt(nonce, data, self._aad)
         # Wire format: nonce + ciphertext (includes tag)
@@ -262,14 +320,17 @@ class AES256GCMTransform(Transform):
         """Decrypt AES-256-GCM data."""
         if len(data) < self.NONCE_SIZE + self.TAG_SIZE:
             raise TransformError("Encrypted data too short")
+        if len(data) > MAX_MESSAGE_SIZE + self.NONCE_SIZE + self.TAG_SIZE:
+            raise TransformError("Encrypted data too large")
         
         nonce = data[:self.NONCE_SIZE]
         ciphertext = data[self.NONCE_SIZE:]
         
         try:
             return self._cipher.decrypt(nonce, ciphertext, self._aad)
-        except Exception as e:
-            raise TransformError(f"Decryption failed: {e}")
+        except Exception:
+            # Sanitize error - don't leak crypto internals
+            raise TransformError("Decryption failed") from None
 
 
 class CompositeTransform(Transform):
@@ -301,6 +362,7 @@ def derive_channel_key(
     channel_id: int,
     is_client: bool,
     use_sha384: bool = False,
+    salt: bytes = b"wslink-v1-channel-key-salt",
 ) -> bytes:
     """Derive a unique encryption key for a channel.
     
@@ -308,20 +370,36 @@ def derive_channel_key(
     The channel ID and direction are included to ensure each
     channel (and direction) has a unique key.
     
+    Security features:
+    - Static salt improves extraction when master key has non-uniform entropy
+    - Master key length validation prevents weak keys
+    - Per-channel/direction isolation via info parameter
+    
     Args:
-        master_key: Shared master key (32 bytes recommended)
+        master_key: Shared master key (minimum 16 bytes, 32 recommended)
         channel_id: Channel ID
         is_client: True for client→server, False for server→client
         use_sha384: Use SHA-384 for CNSA compliance (default: SHA-256)
+        salt: HKDF salt (default: static application-specific salt)
     
     Returns:
         32-byte derived key for this channel
+        
+    Raises:
+        ValueError: If master key is too short
+        TransformError: If cryptography package not available
     """
     try:
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     except ImportError:
         raise TransformError("cryptography package required for key derivation")
+    
+    # Validate master key length
+    if len(master_key) < MIN_MASTER_KEY_LENGTH:
+        raise ValueError(
+            f"Master key must be at least {MIN_MASTER_KEY_LENGTH} bytes, got {len(master_key)}"
+        )
     
     # Build info string: "wslink-channel-{id}-{direction}"
     direction = b"c2s" if is_client else b"s2c"
@@ -333,7 +411,7 @@ def derive_channel_key(
     hkdf = HKDF(
         algorithm=algorithm,
         length=32,
-        salt=None,  # Could add salt for extra security
+        salt=salt,
         info=info,
     )
     return hkdf.derive(master_key)

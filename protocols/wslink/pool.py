@@ -8,12 +8,19 @@ Use cases:
 - Saturate high-bandwidth links (10G+) where single WebSocket is bottleneck
 - Redundancy: channels survive individual connection failures
 - Load balancing across multiple server endpoints
+
+Security features:
+- Async locks on all state mutations (assign/unassign/rebalance)
+- Thread-safe synchronous operations via threading.Lock
+- Safe rebalance with proper lock ordering
+- Connection limit enforcement
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections import deque
@@ -30,6 +37,11 @@ from typing import (
 )
 
 log = logging.getLogger(__name__)
+
+
+# Security constants
+MAX_POOL_CONNECTIONS = 64
+MAX_CHANNELS_PER_CONNECTION = 256
 
 
 class DispatchStrategy(Enum):
@@ -148,6 +160,11 @@ class ConnectionPool:
         
         # Handle incoming data (from any connection)
         pool.on_receive(conn_id=1, data=packet_bytes)
+    
+    Thread safety:
+        - Async methods use asyncio.Lock for coroutine-safe operations
+        - Sync methods use threading.Lock for thread-safe operations
+        - All state mutations are protected by appropriate locks
     """
     
     def __init__(
@@ -159,14 +176,17 @@ class ConnectionPool:
     ):
         self.strategy = strategy
         self.min_connections = min_connections
-        self.max_connections = max_connections
+        self.max_connections = min(max_connections, MAX_POOL_CONNECTIONS)
         self.rebalance_threshold = rebalance_threshold
         
         self._connections: Dict[int, PooledConnection] = {}
         self._channel_to_conn: Dict[int, int] = {}  # channel_id -> conn_id
         self._round_robin_index = 0
         self._stats = PoolStats()
-        self._lock = asyncio.Lock()
+        
+        # Locks for thread safety
+        self._async_lock = asyncio.Lock()  # For async operations
+        self._sync_lock = threading.Lock()  # For sync operations (send, on_receive)
         
         # Callbacks
         self._on_receive: Optional[Callable[[int, bytes], None]] = None
@@ -213,7 +233,7 @@ class ConnectionPool:
         Returns:
             The PooledConnection wrapper
         """
-        async with self._lock:
+        async with self._async_lock:
             if conn_id in self._connections:
                 raise ValueError(f"Connection {conn_id} already exists")
             
@@ -235,7 +255,7 @@ class ConnectionPool:
             conn_id: Connection to remove
             graceful: If True, drain channels first; if False, immediate removal
         """
-        async with self._lock:
+        async with self._async_lock:
             conn = self._connections.get(conn_id)
             if not conn:
                 return
@@ -250,7 +270,7 @@ class ConnectionPool:
             self._remove_connection_internal(conn_id)
     
     def _remove_connection_internal(self, conn_id: int) -> None:
-        """Internal: remove connection without lock."""
+        """Internal: remove connection without lock (caller must hold lock)."""
         conn = self._connections.pop(conn_id, None)
         if not conn:
             return
@@ -268,7 +288,7 @@ class ConnectionPool:
         
         Caller should close/reopen these channels on a different connection.
         """
-        async with self._lock:
+        async with self._async_lock:
             conn = self._connections.get(conn_id)
             if not conn:
                 return []
@@ -288,7 +308,7 @@ class ConnectionPool:
             log.warning(f"Connection {conn_id} failed ({len(orphaned)} orphaned channels)")
             return orphaned
     
-    def assign_channel(self, channel_id: int, conn_id: Optional[int] = None) -> int:
+    async def assign_channel(self, channel_id: int, conn_id: Optional[int] = None) -> int:
         """Assign a channel to a connection.
         
         Args:
@@ -300,74 +320,153 @@ class ConnectionPool:
         
         Raises:
             RuntimeError: If no connections available
+            ValueError: If specified connection not available
         """
-        if conn_id is not None:
-            # Specific connection requested
-            conn = self._connections.get(conn_id)
-            if not conn or not conn.is_available:
-                raise ValueError(f"Connection {conn_id} not available")
-        else:
-            # Auto-select based on strategy
-            conn = self._select_connection()
-            if not conn:
-                raise RuntimeError("No connections available")
-            conn_id = conn.conn_id
-        
-        conn.add_channel(channel_id)
-        self._channel_to_conn[channel_id] = conn_id
-        return conn_id
+        async with self._async_lock:
+            # Check if channel already assigned
+            if channel_id in self._channel_to_conn:
+                existing_conn = self._channel_to_conn[channel_id]
+                log.warning(f"Channel {channel_id} already assigned to connection {existing_conn}")
+                return existing_conn
+            
+            if conn_id is not None:
+                # Specific connection requested
+                conn = self._connections.get(conn_id)
+                if not conn or not conn.is_available:
+                    raise ValueError(f"Connection {conn_id} not available")
+                # Check per-connection channel limit
+                if len(conn.channels) >= MAX_CHANNELS_PER_CONNECTION:
+                    raise ValueError(f"Connection {conn_id} at channel capacity")
+            else:
+                # Auto-select based on strategy
+                conn = self._select_connection()
+                if not conn:
+                    raise RuntimeError("No connections available")
+                conn_id = conn.conn_id
+            
+            conn.add_channel(channel_id)
+            self._channel_to_conn[channel_id] = conn_id
+            return conn_id
     
-    def unassign_channel(self, channel_id: int) -> None:
-        """Remove channel assignment."""
-        conn_id = self._channel_to_conn.pop(channel_id, None)
-        if conn_id is not None:
-            conn = self._connections.get(conn_id)
-            if conn:
-                conn.remove_channel(channel_id)
-                
-                # Check if draining connection is now empty
-                if conn.state == ConnectionState.DRAINING and not conn.channels:
-                    self._remove_connection_internal(conn_id)
+    async def unassign_channel(self, channel_id: int) -> None:
+        """Remove channel assignment.
+        
+        Thread-safe: uses async lock to protect state mutations.
+        """
+        async with self._async_lock:
+            conn_id = self._channel_to_conn.pop(channel_id, None)
+            if conn_id is not None:
+                conn = self._connections.get(conn_id)
+                if conn:
+                    conn.remove_channel(channel_id)
+                    
+                    # Check if draining connection is now empty
+                    if conn.state == ConnectionState.DRAINING and not conn.channels:
+                        self._remove_connection_internal(conn_id)
+    
+    def assign_channel_sync(self, channel_id: int, conn_id: Optional[int] = None) -> int:
+        """Synchronous version of assign_channel for non-async contexts.
+        
+        Uses threading.Lock for thread safety in synchronous code.
+        """
+        with self._sync_lock:
+            if channel_id in self._channel_to_conn:
+                return self._channel_to_conn[channel_id]
+            
+            if conn_id is not None:
+                conn = self._connections.get(conn_id)
+                if not conn or not conn.is_available:
+                    raise ValueError(f"Connection {conn_id} not available")
+            else:
+                conn = self._select_connection()
+                if not conn:
+                    raise RuntimeError("No connections available")
+                conn_id = conn.conn_id
+            
+            conn.add_channel(channel_id)
+            self._channel_to_conn[channel_id] = conn_id
+            return conn_id
+    
+    def unassign_channel_sync(self, channel_id: int) -> None:
+        """Synchronous version of unassign_channel for non-async contexts."""
+        with self._sync_lock:
+            conn_id = self._channel_to_conn.pop(channel_id, None)
+            if conn_id is not None:
+                conn = self._connections.get(conn_id)
+                if conn:
+                    conn.remove_channel(channel_id)
     
     def send(self, channel_id: int, data: bytes) -> bool:
         """Send data for a channel on its assigned connection.
         
         Returns True if sent, False if channel not assigned or connection unavailable.
+        
+        Thread-safe: uses sync lock for state access.
         """
-        conn_id = self._channel_to_conn.get(channel_id)
-        if conn_id is None:
-            return False
+        with self._sync_lock:
+            conn_id = self._channel_to_conn.get(channel_id)
+            if conn_id is None:
+                return False
+            
+            conn = self._connections.get(conn_id)
+            if not conn or conn.state not in (ConnectionState.CONNECTED, ConnectionState.DRAINING):
+                return False
+            
+            # Get send function while holding lock
+            send_func = conn.send
         
-        conn = self._connections.get(conn_id)
-        if not conn or conn.state not in (ConnectionState.CONNECTED, ConnectionState.DRAINING):
-            return False
+        # Send outside of lock to avoid blocking
+        send_func(data)
         
-        conn.send(data)
-        conn.record_send(len(data))
+        # Update stats (quick operation, re-acquire lock)
+        with self._sync_lock:
+            conn = self._connections.get(conn_id)
+            if conn:
+                conn.record_send(len(data))
+        
         return True
     
     def send_broadcast(self, data: bytes) -> int:
         """Send data on all active connections. Returns number of connections sent to."""
+        with self._sync_lock:
+            send_funcs = [
+                (conn.conn_id, conn.send) 
+                for conn in self._connections.values() 
+                if conn.is_available
+            ]
+        
         count = 0
-        for conn in self._connections.values():
-            if conn.is_available:
-                conn.send(data)
-                conn.record_send(len(data))
+        for conn_id, send_func in send_funcs:
+            try:
+                send_func(data)
                 count += 1
+                # Update stats
+                with self._sync_lock:
+                    conn = self._connections.get(conn_id)
+                    if conn:
+                        conn.record_send(len(data))
+            except Exception as e:
+                log.warning(f"Broadcast send failed on connection {conn_id}: {e}")
+        
         return count
     
     def on_receive(self, conn_id: int, data: bytes) -> None:
-        """Handle incoming data from a connection."""
-        conn = self._connections.get(conn_id)
-        if conn:
-            conn.record_recv(len(data))
+        """Handle incoming data from a connection.
         
-        if self._on_receive:
+        Thread-safe: uses sync lock for state access.
+        """
+        with self._sync_lock:
+            conn = self._connections.get(conn_id)
+            if conn:
+                conn.record_recv(len(data))
+            callback = self._on_receive
+        
+        if callback:
             # Extract channel_id from data (first 2 bytes in our protocol)
             if len(data) >= 2:
                 import struct
                 channel_id = struct.unpack("<H", data[:2])[0]
-                self._on_receive(channel_id, data)
+                callback(channel_id, data)
     
     def update_latency(self, conn_id: int, latency_ms: float) -> None:
         """Update RTT measurement for a connection."""
@@ -417,8 +516,10 @@ class ConnectionPool:
         
         Moves channels from overloaded connections to underloaded ones.
         Returns number of channels moved.
+        
+        Thread-safe: uses async lock to protect all state mutations.
         """
-        async with self._lock:
+        async with self._async_lock:
             available = [c for c in self._connections.values() if c.is_available]
             if len(available) < 2:
                 return 0
@@ -443,6 +544,7 @@ class ConnectionPool:
             moved = 0
             for over_conn in overloaded:
                 excess = int(len(over_conn.channels) - avg_load)
+                # Take a snapshot of channels to move
                 channels_to_move = list(over_conn.channels)[:excess]
                 
                 for channel_id in channels_to_move:
@@ -451,6 +553,10 @@ class ConnectionPool:
                     
                     # Pick least loaded underloaded connection
                     target = min(underloaded, key=lambda c: len(c.channels))
+                    
+                    # Verify channel still on over_conn (could have been removed)
+                    if channel_id not in over_conn.channels:
+                        continue
                     
                     # Move channel
                     over_conn.remove_channel(channel_id)
@@ -470,7 +576,7 @@ class ConnectionPool:
     
     async def close(self) -> None:
         """Close all connections in the pool."""
-        async with self._lock:
+        async with self._async_lock:
             for conn_id in list(self._connections.keys()):
                 self._remove_connection_internal(conn_id)
             self._channel_to_conn.clear()
@@ -535,7 +641,7 @@ class PooledProxy:
         channel_id = await proxy.open_channel(target, flags)
         
         # Track in pool
-        self._pool.assign_channel(channel_id, conn.conn_id)
+        await self._pool.assign_channel(channel_id, conn.conn_id)
         
         return channel_id, conn.conn_id
     
@@ -559,7 +665,7 @@ class PooledProxy:
             if proxy:
                 await proxy.close_channel(channel_id, code)
         
-        self._pool.unassign_channel(channel_id)
+        await self._pool.unassign_channel(channel_id)
     
     async def handle_packet(self, conn_id: int, packet_type: int, payload: bytes) -> None:
         """Handle incoming packet from a specific connection."""

@@ -146,7 +146,7 @@ class TestConnectionPool:
         pool = create_pool()
         
         await pool.add_connection(1, lambda x: None)
-        pool.assign_channel(5, conn_id=1)
+        await pool.assign_channel(5, conn_id=1)
         
         # Graceful removal should just mark as draining
         await pool.remove_connection(1, graceful=True)
@@ -156,7 +156,7 @@ class TestConnectionPool:
         assert conn.state == ConnectionState.DRAINING
         
         # Unassign channel - should now remove
-        pool.unassign_channel(5)
+        await pool.unassign_channel(5)
         assert 1 not in pool._connections
     
     @pytest.mark.asyncio
@@ -167,7 +167,7 @@ class TestConnectionPool:
         await pool.add_connection(2, lambda x: None)
         
         # Assign to specific connection
-        assigned = pool.assign_channel(5, conn_id=1)
+        assigned = await pool.assign_channel(5, conn_id=1)
         assert assigned == 1
         
         conn = pool._connections[1]
@@ -181,8 +181,8 @@ class TestConnectionPool:
         await pool.add_connection(2, lambda x: None)
         
         # Auto-select
-        conn1 = pool.assign_channel(5)
-        conn2 = pool.assign_channel(7)
+        conn1 = await pool.assign_channel(5)
+        conn2 = await pool.assign_channel(7)
         
         # Round robin should alternate
         assert conn1 != conn2 or pool.active_connections == 1
@@ -192,7 +192,7 @@ class TestConnectionPool:
         pool = create_pool()
         
         with pytest.raises(RuntimeError, match="No connections available"):
-            pool.assign_channel(5)
+            await pool.assign_channel(5)
     
     @pytest.mark.asyncio
     async def test_send_data(self):
@@ -200,7 +200,7 @@ class TestConnectionPool:
         packets = []
         
         await pool.add_connection(1, packets.append)
-        pool.assign_channel(5, conn_id=1)
+        await pool.assign_channel(5, conn_id=1)
         
         result = pool.send(5, b"test data")
         
@@ -236,8 +236,8 @@ class TestConnectionPool:
         pool = create_pool()
         
         await pool.add_connection(1, lambda x: None)
-        pool.assign_channel(5, conn_id=1)
-        pool.assign_channel(7, conn_id=1)
+        await pool.assign_channel(5, conn_id=1)
+        await pool.assign_channel(7, conn_id=1)
         
         orphaned = await pool.mark_connection_failed(1)
         
@@ -270,7 +270,9 @@ class TestDispatchStrategies:
         await pool.add_connection(3, lambda x: None)
         
         # Should cycle through connections
-        assignments = [pool.assign_channel(i) for i in range(6)]
+        assignments = []
+        for i in range(6):
+            assignments.append(await pool.assign_channel(i))
         
         # Each connection should get 2 channels
         assert assignments.count(1) == 2 or assignments.count(2) == 2
@@ -283,11 +285,11 @@ class TestDispatchStrategies:
         await pool.add_connection(2, lambda x: None)
         
         # Assign some to conn 1
-        pool.assign_channel(10, conn_id=1)
-        pool.assign_channel(11, conn_id=1)
+        await pool.assign_channel(10, conn_id=1)
+        await pool.assign_channel(11, conn_id=1)
         
         # Next should go to conn 2 (least loaded)
-        assigned = pool.assign_channel(12)
+        assigned = await pool.assign_channel(12)
         assert assigned == 2
     
     @pytest.mark.asyncio
@@ -302,7 +304,7 @@ class TestDispatchStrategies:
         pool.update_latency(2, 50.0)
         
         # Should prefer conn 2 (lower latency)
-        assigned = pool.assign_channel(5)
+        assigned = await pool.assign_channel(5)
         assert assigned == 2
 
 
@@ -318,7 +320,7 @@ class TestPoolRebalancing:
         
         # Load up connection 1
         for i in range(10):
-            pool.assign_channel(i, conn_id=1)
+            await pool.assign_channel(i, conn_id=1)
         
         # Connection 2 has 0 channels, conn 1 has 10
         moved = await pool.rebalance()
@@ -345,8 +347,8 @@ class TestPoolStats:
         pool._connections[1].stats.bytes_sent = 100
         pool._connections[2].stats.bytes_sent = 200
         
-        pool.assign_channel(5, conn_id=1)
-        pool.assign_channel(7, conn_id=2)
+        await pool.assign_channel(5, conn_id=1)
+        await pool.assign_channel(7, conn_id=2)
         
         stats = pool.stats
         
@@ -415,8 +417,8 @@ class TestPoolClose:
         
         await pool.add_connection(1, lambda x: None)
         await pool.add_connection(2, lambda x: None)
-        pool.assign_channel(5, conn_id=1)
-        pool.assign_channel(7, conn_id=2)
+        await pool.assign_channel(5, conn_id=1)
+        await pool.assign_channel(7, conn_id=2)
         
         await pool.close()
         

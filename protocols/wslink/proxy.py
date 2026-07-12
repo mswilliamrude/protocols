@@ -5,6 +5,11 @@ This module provides the SocketProxy class that:
 2. Pumps data bidirectionally between channels and targets
 3. Handles flow control (credit/window updates)
 4. Manages channel lifecycle (open, close, error)
+
+Security features:
+- Error sanitization: internal details not leaked to peers
+- Payload validation: size limits and format checks
+- Safe exception handling: no stack traces in responses
 """
 
 from __future__ import annotations
@@ -16,10 +21,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional, Set, Tuple
 
-from .channel import ChannelMux, ChannelState, get_channel_mux
+from .channel import ChannelMux, ChannelState, ChannelError, FlowControlViolation, get_channel_mux
 from .handlers import (
     TargetHandler,
     TargetPolicy,
+    SSRFError,
+    PathTraversalError,
     get_handler,
     DEFAULT_POLICY,
 )
@@ -37,6 +44,23 @@ from .const import (
 )
 
 log = logging.getLogger(__name__)
+
+
+# Security constants
+MAX_PACKET_SIZE = 16 * 1024 * 1024  # 16MB max packet
+MAX_TARGET_LENGTH = 4096
+MAX_ERROR_MESSAGE_LENGTH = 256
+
+# Sanitized error messages (don't leak internal details)
+SANITIZED_ERRORS = {
+    "policy_denied": "Connection not allowed",
+    "target_unreachable": "Target unavailable",
+    "protocol_error": "Protocol error",
+    "internal_error": "Internal error",
+    "flow_violation": "Flow control violation",
+    "ssrf_blocked": "Connection blocked",
+    "path_blocked": "Path not allowed",
+}
 
 
 @dataclass
@@ -101,8 +125,15 @@ class SocketProxy:
         Args:
             packet_type: One of PACK_SOCKET_* constants
             payload: Raw packet payload (after type byte, before CRC)
+            
+        Security: Validates payload size before processing.
         """
         if self._closed:
+            return
+        
+        # Payload size validation
+        if len(payload) > MAX_PACKET_SIZE:
+            log.warning(f"Oversized packet rejected: {len(payload)} bytes")
             return
         
         if packet_type == PACK_SOCKET_OPEN:
@@ -202,10 +233,18 @@ class SocketProxy:
     # --- Internal packet handlers ---
     
     async def _handle_open(self, payload: bytes) -> None:
-        """Handle SOCKET_OPEN packet (server-side)."""
+        """Handle SOCKET_OPEN packet (server-side).
+        
+        Security: Validates target length, uses sanitized error messages.
+        """
         if not self._is_server:
             # Client receiving OPEN — this is a WINDOW response
             # The mux handles state transition
+            return
+        
+        # Validate minimum payload size
+        if len(payload) < 4:
+            log.warning("OPEN packet too short")
             return
         
         # Parse: channel_id (2) + flags (2) + target (null-terminated)
@@ -215,7 +254,19 @@ class SocketProxy:
         # Strip null terminator if present
         if target_bytes.endswith(b"\x00"):
             target_bytes = target_bytes[:-1]
-        target = target_bytes.decode("utf-8")
+        
+        # Validate target length
+        if len(target_bytes) > MAX_TARGET_LENGTH:
+            log.warning(f"Target too long: {len(target_bytes)} bytes")
+            await self._send_error(channel_id, CHANNEL_CLOSE_PROTOCOL_ERROR, SANITIZED_ERRORS["protocol_error"])
+            return
+        
+        try:
+            target = target_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            log.warning(f"Invalid UTF-8 in target for channel {channel_id}")
+            await self._send_error(channel_id, CHANNEL_CLOSE_PROTOCOL_ERROR, SANITIZED_ERRORS["protocol_error"])
+            return
         
         log.debug(f"Received OPEN for channel {channel_id} -> {target}")
         
@@ -223,7 +274,7 @@ class SocketProxy:
         if not self._policy.is_allowed(target):
             self._stats.policy_denials += 1
             log.warning(f"Policy denied target: {target}")
-            await self._send_error(channel_id, CHANNEL_CLOSE_TARGET_REFUSED, "Denied by policy")
+            await self._send_error(channel_id, CHANNEL_CLOSE_TARGET_REFUSED, SANITIZED_ERRORS["policy_denied"])
             return
         
         # Accept the channel in mux - handle_open(channel_id, flags, target)
@@ -231,7 +282,7 @@ class SocketProxy:
             result = self._mux.handle_open(channel_id, flags, target)
         except ValueError as e:
             log.warning(f"Mux rejected channel {channel_id}: {e}")
-            await self._send_error(channel_id, CHANNEL_CLOSE_PROTOCOL_ERROR, str(e))
+            await self._send_error(channel_id, CHANNEL_CLOSE_PROTOCOL_ERROR, SANITIZED_ERRORS["protocol_error"])
             return
         
         # Create handler and connect to target
@@ -239,14 +290,30 @@ class SocketProxy:
             handler = get_handler(channel_id, target, flags)
             await handler.connect()
             self._handlers[channel_id] = handler
+        except SSRFError as e:
+            self._stats.connect_failures += 1
+            log.warning(f"SSRF blocked for channel {channel_id}: {e}")
+            await self._send_error(channel_id, CHANNEL_CLOSE_TARGET_REFUSED, SANITIZED_ERRORS["ssrf_blocked"])
+            self._try_close_mux_channel(channel_id, CHANNEL_CLOSE_TARGET_REFUSED)
+            return
+        except PathTraversalError as e:
+            self._stats.connect_failures += 1
+            log.warning(f"Path traversal blocked for channel {channel_id}: {e}")
+            await self._send_error(channel_id, CHANNEL_CLOSE_TARGET_REFUSED, SANITIZED_ERRORS["path_blocked"])
+            self._try_close_mux_channel(channel_id, CHANNEL_CLOSE_TARGET_REFUSED)
+            return
+        except (ConnectionError, TimeoutError) as e:
+            self._stats.connect_failures += 1
+            log.warning(f"Connection failed for channel {channel_id}: {type(e).__name__}")
+            await self._send_error(channel_id, CHANNEL_CLOSE_TARGET_UNREACHABLE, SANITIZED_ERRORS["target_unreachable"])
+            self._try_close_mux_channel(channel_id, CHANNEL_CLOSE_TARGET_UNREACHABLE)
+            return
         except Exception as e:
             self._stats.connect_failures += 1
-            log.error(f"Failed to connect to {target}: {e}")
-            await self._send_error(channel_id, CHANNEL_CLOSE_TARGET_UNREACHABLE, str(e))
-            try:
-                self._mux.close_channel(channel_id, CHANNEL_CLOSE_TARGET_UNREACHABLE)
-            except ValueError:
-                pass  # Channel might not be registered yet
+            # Log full error internally, but don't send it to peer
+            log.error(f"Unexpected error connecting channel {channel_id}: {e}")
+            await self._send_error(channel_id, CHANNEL_CLOSE_TARGET_UNREACHABLE, SANITIZED_ERRORS["internal_error"])
+            self._try_close_mux_channel(channel_id, CHANNEL_CLOSE_TARGET_UNREACHABLE)
             return
         
         # Send WINDOW to confirm channel is open - grant_window returns packet bytes
@@ -261,8 +328,23 @@ class SocketProxy:
         self._stats.channels_opened += 1
         log.info(f"Channel {channel_id} connected to {target}")
     
+    def _try_close_mux_channel(self, channel_id: int, code: int) -> None:
+        """Attempt to close a channel in the mux, ignoring errors."""
+        try:
+            self._mux.close_channel(channel_id, code)
+        except ValueError:
+            pass  # Channel might not be registered yet
+    
     async def _handle_data(self, payload: bytes) -> None:
-        """Handle SOCKET_DATA packet."""
+        """Handle SOCKET_DATA packet.
+        
+        Security: Validates payload format and handles flow control violations.
+        """
+        # Validate minimum payload size
+        if len(payload) < 2:
+            log.warning("DATA packet too short")
+            return
+        
         # Parse: channel_id (2) + data
         channel_id = struct.unpack("<H", payload[:2])[0]
         data = payload[2:]
@@ -270,6 +352,11 @@ class SocketProxy:
         # Update mux flow control - returns (data, should_send_window)
         try:
             _, should_send_window = self._mux.handle_data(channel_id, data)
+        except FlowControlViolation as e:
+            log.warning(f"Flow control violation on channel {channel_id}: {e}")
+            await self._send_error(channel_id, CHANNEL_CLOSE_PROTOCOL_ERROR, SANITIZED_ERRORS["flow_violation"])
+            await self.close_channel(channel_id, CHANNEL_CLOSE_PROTOCOL_ERROR)
+            return
         except ValueError as e:
             log.warning(f"Data rejected for channel {channel_id}: {e}")
             return
@@ -286,7 +373,7 @@ class SocketProxy:
                 await handler.write(data)
                 self._stats.bytes_to_targets += len(data)
             except Exception as e:
-                log.error(f"Write to target failed on channel {channel_id}: {e}")
+                log.warning(f"Write to target failed on channel {channel_id}: {type(e).__name__}")
                 await self.close_channel(channel_id, CHANNEL_CLOSE_TARGET_UNREACHABLE)
     
     async def _handle_close(self, payload: bytes) -> None:
@@ -306,23 +393,55 @@ class SocketProxy:
         self._stats.channels_closed += 1
     
     async def _handle_error(self, payload: bytes) -> None:
-        """Handle SOCKET_ERROR packet."""
+        """Handle SOCKET_ERROR packet.
+        
+        Security: Truncates and sanitizes error messages in logs.
+        """
+        # Validate minimum payload size
+        if len(payload) < 4:
+            log.warning("ERROR packet too short")
+            return
+        
         channel_id, code = struct.unpack("<HH", payload[:4])
-        message = payload[4:].decode("utf-8", errors="replace")
         
-        log.warning(f"Error on channel {channel_id}: {code} - {message}")
+        # Truncate and sanitize message for logging
+        raw_message = payload[4:][:MAX_ERROR_MESSAGE_LENGTH]
+        message = raw_message.decode("utf-8", errors="replace")
         
-        self._mux.handle_error(channel_id, code, message)
+        # Log sanitized version (don't log potentially sensitive full message)
+        log.warning(f"Error on channel {channel_id}: code={code}")
+        
+        try:
+            self._mux.handle_error(channel_id, code, message)
+        except ValueError:
+            pass  # Channel unknown
+        
         await self._cleanup_channel(channel_id)
         self._stats.channels_errored += 1
     
     async def _handle_window(self, payload: bytes) -> None:
-        """Handle SOCKET_WINDOW packet."""
+        """Handle SOCKET_WINDOW packet.
+        
+        Security: Validates payload format and handles credit overflow.
+        """
+        # Validate minimum payload size
+        if len(payload) < 6:
+            log.warning("WINDOW packet too short")
+            return
+        
         channel_id, credit = struct.unpack("<HI", payload[:6])
         
         log.debug(f"Window update for channel {channel_id}: +{credit}")
         
-        self._mux.handle_window(channel_id, credit)
+        try:
+            self._mux.handle_window(channel_id, credit)
+        except FlowControlViolation as e:
+            log.warning(f"Credit overflow on channel {channel_id}: {e}")
+            await self._send_error(channel_id, CHANNEL_CLOSE_PROTOCOL_ERROR, SANITIZED_ERRORS["flow_violation"])
+            await self.close_channel(channel_id, CHANNEL_CLOSE_PROTOCOL_ERROR)
+            return
+        except ValueError as e:
+            log.warning(f"Window rejected for channel {channel_id}")
         
         # If this is the first WINDOW (channel confirmation), we can start using it
         # The mux handles state transition internally
@@ -330,7 +449,10 @@ class SocketProxy:
     # --- Internal helpers ---
     
     async def _pump_from_target(self, channel_id: int, handler: TargetHandler) -> None:
-        """Pump data from target to channel."""
+        """Pump data from target to channel.
+        
+        Security: Exceptions logged internally but not leaked to peer.
+        """
         try:
             while handler.connected and not self._closed:
                 data = await handler.read(32768)  # 32KB chunks
@@ -359,15 +481,20 @@ class SocketProxy:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            log.error(f"Pump error on channel {channel_id}: {e}")
+            # Log error internally but don't leak details to peer
+            log.warning(f"Pump error on channel {channel_id}: {type(e).__name__}")
             await self.close_channel(channel_id, CHANNEL_CLOSE_TARGET_UNREACHABLE)
     
     async def _send_error(self, channel_id: int, code: int, message: str) -> None:
         """Send an error packet.
         
         Can be called even for channels not registered in mux (e.g., policy denial).
+        
+        Security: Message is truncated and should be a pre-defined sanitized string.
+        Never send raw exception messages to peers.
         """
-        msg_bytes = message.encode("utf-8")[:256]  # Limit message length
+        # Enforce message length limit
+        msg_bytes = message.encode("utf-8")[:MAX_ERROR_MESSAGE_LENGTH]
         packet = struct.pack("<HHH", channel_id, code, len(msg_bytes)) + msg_bytes
         self._send(self._frame_packet(PACK_SOCKET_ERROR, packet))
     
