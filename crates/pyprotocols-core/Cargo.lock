@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "pyprotocols-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "crc32fast",
  "pyo3",

@@ -21,6 +21,7 @@ pub mod transport;
 pub mod protocols;
 pub mod capabilities;
 pub mod events;
+pub mod channel;
 
 // PyO3 module definition
 use pyo3::prelude::*;
@@ -42,6 +43,16 @@ fn pyprotocols_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<protocols::wslink::SequencePacket>()?;
     m.add_class::<protocols::wslink::ResumeVerifyPacket>()?;
     m.add_class::<protocols::wslink::LinkStatsTracker>()?;
+
+    // WSLink socket proxy packets
+    m.add_class::<protocols::wslink::SocketOpenPacket>()?;
+    m.add_class::<protocols::wslink::SocketDataPacket>()?;
+    m.add_class::<protocols::wslink::SocketClosePacket>()?;
+    m.add_class::<protocols::wslink::SocketErrorPacket>()?;
+    m.add_class::<protocols::wslink::SocketWindowPacket>()?;
+
+    // WSLink channel multiplexer
+    m.add_class::<channel::ChannelMux>()?;
 
     // WSLink constants
     protocols::wslink::register_constants(m)?;
