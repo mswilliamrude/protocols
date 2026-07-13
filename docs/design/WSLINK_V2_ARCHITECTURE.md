@@ -1,7 +1,11 @@
 # WSLink v2 — Architecture, Decisions & Reasoning
 
-> Status: **DESIGN / PROPOSAL** (docs only — no code changes in this branch)
-> Branch: `fix/wslink-extension-api-observability`
+> Status: **Phase 1 IMPLEMENTED** (v1.1.0). The extension API, observability,
+> capability-negotiation plumbing, and the safe correctness fixes have landed in
+> code (Python + congruent Rust). Behaviour-changing capability *flips* (actually
+> skipping CRC/ARQ) remain deferred and gated — see §3.3 / §8. Original review was
+> docs-only; this header updated on merge to `main`.
+> Origin branch: `fix/wslink-extension-api-observability`
 > Scope: the WSLink protocol (`protocols/wslink/`, `crates/pyprotocols-core/`) and its
 > primary consumer, the Unimind MCP router (`Skill_MultiAgent/unimind/mcp/router.py`).
 

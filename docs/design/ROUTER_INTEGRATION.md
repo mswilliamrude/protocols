@@ -1,6 +1,8 @@
 # WSLink v2 — Router Integration (before / after)
 
-> Status: **DESIGN / PROPOSAL** (docs only)
+> Status: **PROPOSAL** (the protocol-side API it targets is IMPLEMENTED in v1.1.0;
+> the router-side rewrite below is not yet applied — it lives in the
+> `Skill_MultiAgent` repo, tracked for the integrating agent). Docs only here.
 > Companion to [`WSLINK_V2_ARCHITECTURE.md`](./WSLINK_V2_ARCHITECTURE.md) (§3.7, §9) and
 > [`WSLINK_EXTENSION_API.md`](./WSLINK_EXTENSION_API.md).
 > Subject: `Skill_MultiAgent/unimind/mcp/router.py` (1533 lines). Citations: `path:line`,

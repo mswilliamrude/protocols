@@ -1,6 +1,9 @@
 # WSLink v2 — Extension & Observability API
 
-> Status: **DESIGN / PROPOSAL** (docs only)
+> Status: **IMPLEMENTED** (v1.1.0) — `register_packet_handler`, `subscribe`,
+> `negotiated_capabilities`, `send()`, and the event schema below are live in
+> `protocols/wslink/protocol/{wslink,events,capabilities}.py` with congruent Rust
+> in `crates/pyprotocols-core/src/{capabilities,events}.rs`.
 > Companion to [`WSLINK_V2_ARCHITECTURE.md`](./WSLINK_V2_ARCHITECTURE.md) (§3.7, §7).
 > Citation convention: `path:line`, verbatim excerpts trimmed with `…`, paths
 > relative to `/opt/git/`, tree at branch point `42ab65f`.

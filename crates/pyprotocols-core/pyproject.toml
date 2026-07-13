@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pyprotocols-core"
-version = "1.0.0"
+version = "1.1.0"
 description = "High-performance file transfer protocol core (Rust + PyO3)"
 requires-python = ">=3.9"
 license = {text = "MIT"}
