@@ -1,5 +1,6 @@
 import asyncio
 import collections
+import dataclasses
 import os
 import struct
 import time
@@ -9,8 +10,30 @@ import zlib
 from ..const import *
 from .structs.structs import FileHeaderPacket, SequencePacket, ResumeVerifyPacket
 from .framer import WSLinkFramer
+from .events import EventKind, ProtocolEvent, SessionObserver, CallbackObserver, Subscription
+from .capabilities import TransportCapabilities, VERSION as CAPS_VERSION
 
 log = logging.getLogger(__name__)
+
+
+def _mono() -> float:
+    """Monotonic clock for all interval/RTT math.
+
+    Never use wall clock (`time.time()`) for durations: an NTP step can move it
+    backward and produce garbage/negative RTT samples. Wall clock is reserved for
+    file mtimes only.
+    """
+    return time.monotonic()
+
+
+# Builtin packet types owned by the session FSM. Consumer handlers may not shadow
+# these unless override=True is passed to register_packet_handler.
+_BUILTIN_PACKET_TYPES = frozenset({
+    PACK_ACK_BLOCK, PACK_CLOSE_FILE, PACK_DATA_BLOCK, PACK_CHAT_BLOCK,
+    PACK_SKIP_FILE, PACK_NAK_BLOCK, PACK_OPEN_FILE, PACK_PING,
+    PACK_READY_RECV, PACK_READY, PACK_SEEK_BLOCK, PACK_VERIFY_BLOCK,
+    PACK_PONG, PACK_TRANSMIT_DONE,
+})
 
 class WSLinkSession:
     def __init__(self, transport, **kwargs):
@@ -18,7 +41,7 @@ class WSLinkSession:
         self.framer = WSLinkFramer(transport)
         
         # State
-        self.state = "INIT"
+        self._state = "INIT"
         self.recv_dir = kwargs.get('recv_dir', '.')
         
         # Sender state
@@ -59,7 +82,7 @@ class WSLinkSession:
         # available as pyprotocols_core.LinkStatsTracker (Rust/PyO3); this
         # inline version keeps the pure-Python session self-contained with no
         # compiled-extension dependency.
-        self._stats_session_start = time.time()
+        self._stats_session_start = _mono()
         self._stats_bytes_sent = 0
         self._stats_bytes_received = 0
         self._stats_blocks_acked = 0
@@ -76,7 +99,133 @@ class WSLinkSession:
         self._stats_arq_timeouts = 0
         self._stats_transfer_start = 0.0  # time of first data block in current file
         self._stats_current_file_size = 0
-        
+
+        # ─── Extension & Observability (v2) ───────────────────────────
+        # Consumer-registered packet handlers for new (non-builtin) types, e.g.
+        # the socket-proxy's lowercase channel types. This is the supported
+        # replacement for monkeypatching `_handle_packet`.
+        self._packet_handlers = {}                      # bytes(1) -> async handler(pkt_type, payload)
+        # Protocol-event observers. The session builds/dispatches ProtocolEvent
+        # objects ONLY when this list is non-empty (zero-cost when unused).
+        self._subscriptions = []                        # list[Subscription]
+        # Capability negotiation. Advertising is opt-in so the wire stays
+        # byte-identical to legacy peers unless explicitly enabled. Even when
+        # advertised, the local default equals legacy behaviour (CRC on, ARQ on).
+        self._advertise_capabilities = bool(kwargs.get('advertise_capabilities', False))
+        self._local_capabilities = kwargs.get('local_capabilities') or TransportCapabilities.legacy()
+        # A v2 session that advertises inherently speaks the current caps VERSION;
+        # stamp it so negotiation yields the correct min-of-both-versions.
+        if self._advertise_capabilities and self._local_capabilities.version == 0:
+            self._local_capabilities = dataclasses.replace(self._local_capabilities, version=CAPS_VERSION)
+        self._negotiated_capabilities = TransportCapabilities.legacy()
+        # Stable id used in emitted events.
+        self.session_id = kwargs.get('session_id') or f"wslink-{id(self):x}"
+
+    # ── State machine (observable) ────────────────────────────────────
+    @property
+    def state(self) -> str:
+        """Current FSM state (read-only; write via :meth:`_set_state`)."""
+        return self._state
+
+    def _set_state(self, new_state: str, reason: str = "") -> None:
+        """Transition the FSM and emit a ``state_change`` event.
+
+        Centralising state writes is what makes transitions observable — e.g. the
+        historical TRANSMIT_DONE/Z chat-kill race would surface here as
+        ``state_change{old=TRANSFERRING, new=DONE, reason=...}``.
+        """
+        old = self._state
+        if old == new_state:
+            return
+        self._state = new_state
+        self._emit(EventKind.STATE_CHANGE, old=old, new=new_state, reason=reason)
+
+    # ── Extension API ─────────────────────────────────────────────────
+    def register_packet_handler(self, pkt_type, handler, *, override: bool = False) -> None:
+        """Register an async handler for a packet type.
+
+        Args:
+            pkt_type: single-byte packet type (``bytes`` of length 1).
+            handler: ``async def handler(pkt_type: bytes, payload: bytes)``.
+            override: allow shadowing a builtin type (default: refuse).
+
+        Raises:
+            ValueError: on malformed type or a refused builtin collision.
+        """
+        if not isinstance(pkt_type, (bytes, bytearray)) or len(pkt_type) != 1:
+            raise ValueError("pkt_type must be a single byte")
+        pkt_type = bytes(pkt_type)
+        if not callable(handler):
+            raise ValueError("handler must be callable")
+        if not override and pkt_type in _BUILTIN_PACKET_TYPES:
+            raise ValueError(f"refusing to shadow builtin packet type {pkt_type!r} (pass override=True)")
+        self._packet_handlers[pkt_type] = handler
+
+    def unregister_packet_handler(self, pkt_type) -> None:
+        """Remove a previously registered handler (no-op if absent)."""
+        self._packet_handlers.pop(bytes(pkt_type), None)
+
+    def subscribe(self, observer, *, sample_rate: int = 1, level: str = "info") -> None:
+        """Subscribe an observer to protocol events.
+
+        Args:
+            observer: a :class:`SessionObserver`, or a plain callable (wrapped in
+                :class:`CallbackObserver`).
+            sample_rate: deliver only every Nth ``frame`` event (other kinds are
+                always delivered). Keeps per-frame observation cheap at wire speed.
+            level: advisory verbosity filter.
+        """
+        if not isinstance(observer, SessionObserver):
+            if callable(observer):
+                observer = CallbackObserver(observer)
+            else:
+                raise TypeError("observer must be a SessionObserver or callable")
+        self._subscriptions.append(Subscription(observer=observer,
+                                                sample_rate=max(1, int(sample_rate)),
+                                                level=level))
+
+    def unsubscribe(self, observer) -> None:
+        """Remove an observer (matches the wrapped callable or the observer itself)."""
+        self._subscriptions = [
+            s for s in self._subscriptions
+            if s.observer is not observer
+            and not (isinstance(s.observer, CallbackObserver) and s.observer._callback is observer)
+        ]
+
+    async def send(self, pkt_type, payload: bytes = b"") -> None:
+        """Public egress: frame and send a packet immediately.
+
+        Supported alternative to reaching into ``session.framer`` — used by
+        consumers (e.g. the socket proxy) to emit their own registered types.
+        """
+        await self.framer.send_packet_immediate(pkt_type, payload)
+
+    @property
+    def negotiated_capabilities(self) -> TransportCapabilities:
+        """The effective capabilities after handshake negotiation."""
+        return self._negotiated_capabilities
+
+    def _emit(self, kind: str, **payload) -> None:
+        """Build and dispatch a :class:`ProtocolEvent` to all subscribers.
+
+        Zero-cost when there are no subscribers: returns before constructing any
+        object. Observer exceptions are caught and logged, never propagated.
+        """
+        subs = self._subscriptions
+        if not subs:
+            return
+        event = None
+        for sub in subs:
+            if not sub.wants(kind):
+                continue
+            if event is None:
+                event = ProtocolEvent(kind=kind, ts_monotonic=_mono(),
+                                      session_id=self.session_id, payload=payload)
+            try:
+                sub.observer.on_event(event)
+            except Exception as e:  # never let observation break the protocol
+                log.debug("observer raised on %s event: %s", kind, e)
+
     def add_files(self, file_paths):
         self.files_to_send.extend(file_paths)
         # Wake the send loop. Without this, files queued AFTER the session is
@@ -94,7 +243,7 @@ class WSLinkSession:
         Returns a dict suitable for JSON serialization with all link metrics.
         Can be called at any time — safe from any coroutine or thread.
         """
-        now = time.time()
+        now = _mono()
         session_elapsed = now - self._stats_session_start
 
         # RTT statistics
@@ -216,15 +365,26 @@ class WSLinkSession:
             "block_size": self.block_size,
             "arq_timeout_s": self.arq_timeout,
             "heartbeat_interval_s": self.heartbeat_interval,
+
+            # v2 — capabilities & observability
+            "caps_version": self._negotiated_capabilities.version,
+            "caps_wire_crc": self._negotiated_capabilities.wire_crc,
+            "caps_reliable": self._negotiated_capabilities.is_reliable,
+            "caps_max_block_size": self._negotiated_capabilities.max_block_size,
+            "observers": len(self._subscriptions),
+            "registered_handlers": len(self._packet_handlers),
         }
 
     async def send_chat(self, message: bytes):
         await self.framer.send_packet_immediate(PACK_CHAT_BLOCK, message)
         
     async def loop(self):
-        # Initial Handshake
+        # Initial Handshake. The READY payload carries the local capability
+        # advertisement when enabled; legacy peers ignore it (backward-compatible).
+        # Advertising is opt-in so the wire stays byte-identical by default.
         log.debug("Sending Handshake (R and Q)...")
-        await self.framer.send_packet_immediate(PACK_READY, b"")
+        ready_payload = self._local_capabilities.encode() if self._advertise_capabilities else b""
+        await self.framer.send_packet_immediate(PACK_READY, ready_payload)
         await self.framer.send_packet_immediate(PACK_READY_RECV, b"")
         
         recv_task = asyncio.create_task(self._recv_loop())
@@ -235,7 +395,7 @@ class WSLinkSession:
             await asyncio.gather(recv_task, send_task, heartbeat_task)
         except Exception as e:
             log.error(f"WSLinkSession loop error: {e}\n{traceback.format_exc()}")
-            self.state = "DONE"
+            self._set_state("DONE", reason="loop_error")
 
     async def _heartbeat_loop(self):
         """Send periodic PING to keep the connection alive and detect dead peers."""
@@ -244,14 +404,16 @@ class WSLinkSession:
             if self.state == "DONE":
                 break
             try:
-                # Send PING with timestamp for RTT measurement
-                payload = struct.pack('<d', time.time())
+                # Send PING with a MONOTONIC timestamp for RTT measurement. The
+                # value is echoed back and compared by THIS peer only, so a
+                # monotonic origin is both correct and immune to NTP steps.
+                payload = struct.pack('<d', _mono())
                 await self.framer.send_packet_immediate(PACK_PING, payload)
                 self._stats_pings_sent += 1
                 log.debug("Heartbeat PING sent")
             except Exception as e:
                 log.warning(f"Heartbeat send failed: {e}")
-                self.state = "DONE"
+                self._set_state("DONE", reason="heartbeat_send_failed")
                 break
         
     async def _recv_loop(self):
@@ -266,13 +428,13 @@ class WSLinkSession:
                     packet = await self.framer.read_packet()
             except asyncio.TimeoutError:
                 log.warning(f"Idle timeout — no data received in {self.idle_timeout}s. Closing session.")
-                self.state = "DONE"
+                self._set_state("DONE", reason="idle_timeout")
                 break
                 
             if not packet:
                 # EOF or dropped connection
                 log.info("Connection closed by peer or read timeout.")
-                self.state = "DONE"
+                self._set_state("DONE", reason="peer_closed")
                 break
                 
             pkt_type, payload = packet
@@ -286,6 +448,8 @@ class WSLinkSession:
             if pkt_type == b'?':
                 self._stats_crc_failures += 1
                 log.warning("CRC integrity failure detected, frame discarded.")
+                self._emit(EventKind.INTEGRITY, reason="crc_or_length",
+                           crc_failures=self._stats_crc_failures)
                 continue
 
             try:
@@ -303,7 +467,7 @@ class WSLinkSession:
                     await self._pump_sender()
                 except Exception as e:
                     log.error(f"Sender error: {e}\n{traceback.format_exc()}")
-                    self.state = "DONE"
+                    self._set_state("DONE", reason="sender_error")
                     break
 
             # If an event arrived during pump, loop immediately
@@ -345,7 +509,9 @@ class WSLinkSession:
         self.unacked_blocks.clear()
         self.block_send_times.clear()
         self._stats_current_file_size = size
-        self._stats_transfer_start = time.time()
+        self._stats_transfer_start = _mono()
+        self._emit(EventKind.TRANSFER, event="open", file=os.path.basename(filepath),
+                   size=size, blocks=blocks)
 
     async def _pump_sender(self):
         if self._sent_z:
@@ -366,11 +532,12 @@ class WSLinkSession:
 
         # ARQ Timeout Logic
         if self.unacked_blocks:
-            current_time = time.time()
+            current_time = _mono()
             oldest_block = min(self.unacked_blocks.keys())
             send_time = self.block_send_times.get(oldest_block, current_time)
             if current_time - send_time > self.arq_timeout:
                 log.warning(f"ARQ Timeout! Resending block {oldest_block}. Throttling window.")
+                _win_before = self.window_size
                 self.window_size = max(1, self.window_size // 2) # Halve window on timeout
                 self._stats_window_shrinks += 1
                 self._stats_arq_timeouts += 1
@@ -380,10 +547,13 @@ class WSLinkSession:
                 await self.framer.send_packet_immediate(PACK_DATA_BLOCK, stored_payload)
                 self._stats_bytes_sent += len(stored_payload)
                 self.block_send_times[oldest_block] = current_time # Reset timer
+                self._emit(EventKind.CONGESTION, event="arq_timeout", reason="arq_timeout",
+                           window_before=_win_before, window_after=self.window_size,
+                           block=oldest_block)
                 
         # Fill Window — buffer all data frames, flush once at the end
         sent_any = False
-        fill_time = time.time()  # Single timestamp for entire burst
+        fill_time = _mono()  # Single timestamp for entire burst
         while len(self.unacked_blocks) < self.window_size and self.next_block_num < self.total_blocks:
             chunk = self.current_fd.read(self.block_size)
             if not chunk:
@@ -407,6 +577,7 @@ class WSLinkSession:
         # EOF Handle
         if self.next_block_num >= self.total_blocks and not self.unacked_blocks:
             log.info(f"File {self.current_file} successfully transferred.")
+            _done_file = os.path.basename(self.current_file) if self.current_file else None
             await self.framer.send_packet_immediate(PACK_CLOSE_FILE, b"")
             self.current_fd.close()
             self.current_file = None
@@ -414,12 +585,15 @@ class WSLinkSession:
             self._stats_files_completed_send += 1
             self._stats_transfer_start = 0.0
             self._stats_current_file_size = 0
+            self._emit(EventKind.TRANSFER, event="complete_send", file=_done_file,
+                       files_completed=self._stats_files_completed_send)
 
     def _update_rtt(self, rtt: float):
         self.rtt_history.append(rtt)  # deque(maxlen=N) auto-evicts oldest
             
         avg_rtt = sum(self.rtt_history) / len(self.rtt_history)
-        
+        _win_before = self.window_size
+
         # BBR-style naive scale: if link is fast and window is full, increase window.
         if avg_rtt < 0.1 and len(self.unacked_blocks) >= self.window_size * 0.8:
             self.window_size = min(self.max_window_size, self.window_size + 1)
@@ -429,7 +603,27 @@ class WSLinkSession:
             self.window_size = max(1, int(self.window_size * 0.9))
             self._stats_window_shrinks += 1
 
+        # Observability: RTT sample always; congestion event only on a window change.
+        if self._subscriptions:
+            self._emit(EventKind.RTT_SAMPLE, rtt_ms=round(rtt * 1000, 3),
+                       avg_rtt_ms=round(avg_rtt * 1000, 3),
+                       window=self.window_size, inflight=len(self.unacked_blocks))
+            if self.window_size != _win_before:
+                self._emit(EventKind.CONGESTION,
+                           event="window_grow" if self.window_size > _win_before else "window_shrink",
+                           reason="rtt_scale", window_before=_win_before,
+                           window_after=self.window_size, avg_rtt_ms=round(avg_rtt * 1000, 3))
+
     async def _handle_packet(self, pkt_type: bytes, payload: bytes):
+        # Consumer-registered handlers take precedence for their types. This is
+        # the supported replacement for monkeypatching _handle_packet: e.g. the
+        # socket proxy registers its lowercase channel types here instead of
+        # wrapping this method. Builtins cannot be shadowed unless override=True.
+        handler = self._packet_handlers.get(pkt_type)
+        if handler is not None:
+            await handler(pkt_type, payload)
+            return
+
         # Heartbeat: PING/PONG allowed in any state (keepalive)
         if pkt_type == PACK_PING:
             # Respond with PONG (echo payload back for RTT measurement)
@@ -438,11 +632,19 @@ class WSLinkSession:
             return
 
         if pkt_type == PACK_PONG:
-            # Measure RTT from ping timestamp
+            # Measure RTT from ping timestamp (monotonic origin — see _heartbeat_loop).
+            # NOTE: heartbeat RTT is surfaced for observability ONLY; it deliberately
+            # does NOT feed the congestion window (that stays driven by data-block
+            # ACKs, preserving pre-v2 behaviour). This is the "own probe" the timing
+            # telemetry needs once ARQ/ACK RTT sampling is reduced.
             if len(payload) >= 8:
                 ping_time = struct.unpack('<d', payload[:8])[0]
-                rtt = time.time() - ping_time
+                rtt = _mono() - ping_time
                 self._stats_pongs_received += 1
+                if rtt >= 0 and self._subscriptions:
+                    self._emit(EventKind.RTT_SAMPLE, source="heartbeat",
+                               rtt_ms=round(rtt * 1000, 3), window=self.window_size,
+                               inflight=len(self.unacked_blocks))
                 log.debug(f"Heartbeat PONG received (RTT: {rtt*1000:.1f}ms)")
             return
 
@@ -456,9 +658,18 @@ class WSLinkSession:
 
         # Handshake packets — only valid in INIT state
         if pkt_type in (PACK_READY, PACK_READY_RECV):
+            # Parse a capability advertisement if the peer included one (READY only).
+            # Legacy peers send an empty payload -> decode() returns None -> we keep
+            # the conservative legacy negotiation (CRC on, ARQ on).
+            if pkt_type == PACK_READY and payload:
+                remote_caps = TransportCapabilities.decode(payload)
+                if remote_caps is not None:
+                    self._negotiated_capabilities = TransportCapabilities.negotiate(
+                        self._local_capabilities, remote_caps)
+                    log.info(f"WSLink capabilities negotiated: {self._negotiated_capabilities}")
             if self.state == "INIT":
                 log.info("Handshake sync complete. Connection established.")
-                self.state = "TRANSFERRING"
+                self._set_state("TRANSFERRING", reason="handshake")
                 self._send_event.set()  # Wake sender to start transfer
             return
 
@@ -474,7 +685,7 @@ class WSLinkSession:
                 
                 # RTT measurement — only accurate for the specific block ACKed
                 if ack_block in self.block_send_times:
-                    rtt = time.time() - self.block_send_times[ack_block]
+                    rtt = _mono() - self.block_send_times[ack_block]
                     self._update_rtt(rtt)
                 
                 # Selective ACK: only clear the specific block acknowledged.
@@ -496,6 +707,7 @@ class WSLinkSession:
                 nak_block = seq['block']
                 if nak_block in self.unacked_blocks:
                     log.warning(f"Received NAK for block {nak_block}. Resending.")
+                    _win_before = self.window_size
                     self.window_size = max(1, self.window_size // 2) # Halve on drop
                     self._stats_window_shrinks += 1
                     self._stats_blocks_naked += 1
@@ -503,7 +715,10 @@ class WSLinkSession:
                     stored_payload = self.unacked_blocks[nak_block]
                     await self.framer.send_packet_immediate(PACK_DATA_BLOCK, stored_payload)
                     self._stats_bytes_sent += len(stored_payload)
-                    self.block_send_times[nak_block] = time.time()
+                    self.block_send_times[nak_block] = _mono()
+                    self._emit(EventKind.CONGESTION, event="nak", reason="nak",
+                               window_before=_win_before, window_after=self.window_size,
+                               block=nak_block)
                 
         elif pkt_type == PACK_OPEN_FILE:
             header = FileHeaderPacket.unpack(payload)

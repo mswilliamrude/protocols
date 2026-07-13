@@ -19,6 +19,8 @@ pub mod file_safety;
 pub mod framer;
 pub mod transport;
 pub mod protocols;
+pub mod capabilities;
+pub mod events;
 
 // PyO3 module definition
 use pyo3::prelude::*;
@@ -52,6 +54,11 @@ fn pyprotocols_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // ZMODEM codec
     protocols::zmodem::register(m)?;
+
+    // WSLink v2 — transport capabilities + observability event-kind constants
+    m.add_class::<capabilities::TransportCapabilities>()?;
+    capabilities::register_constants(m)?;
+    events::register_constants(m)?;
 
     Ok(())
 }
