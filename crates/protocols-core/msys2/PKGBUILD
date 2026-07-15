@@ -1,0 +1,44 @@
+# Maintainer: Your Name <your.email@example.com>
+
+_realname=python-protocols
+pkgbase=mingw-w64-${_realname}
+pkgname="${MINGW_PACKAGE_PREFIX}-${_realname}"
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="High-performance file transfer protocols (ZMODEM, HS/Link, WS/Link) with Rust acceleration"
+arch=('any')
+url="https://github.com/your-org/protocols"
+license=('MIT')
+depends=(
+    "${MINGW_PACKAGE_PREFIX}-python"
+)
+makedepends=(
+    "${MINGW_PACKAGE_PREFIX}-python-maturin"
+    "${MINGW_PACKAGE_PREFIX}-rust"
+    "${MINGW_PACKAGE_PREFIX}-python-installer"
+)
+source=()  # Will be filled in for releases, or use local build
+sha256sums=()
+
+build() {
+    cd "${srcdir}/../.."
+    
+    # Build the wheel using maturin
+    maturin build --release --strip
+}
+
+package() {
+    cd "${srcdir}/../.."
+    
+    # Find the built wheel
+    local _wheel=$(find target/wheels -name "protocols-${pkgver}*.whl" | head -1)
+    
+    if [[ -z "$_wheel" ]]; then
+        error "No wheel found! Run 'maturin build --release' first."
+        return 1
+    fi
+    
+    # Install using pip/installer
+    MSYS2_ARG_CONV_EXCL="--prefix=" \
+        python -m installer --prefix="${MINGW_PREFIX}" --destdir="${pkgdir}" "$_wheel"
+}

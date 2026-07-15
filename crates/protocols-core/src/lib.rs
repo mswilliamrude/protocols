@@ -26,9 +26,9 @@ pub mod channel;
 // PyO3 module definition
 use pyo3::prelude::*;
 
-/// Python module: `import pyprotocols_core`
-#[pymodule]
-fn pyprotocols_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+/// Python module: `import protocols`
+#[pymodule(name = "protocols")]
+fn protocols_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // CRC functions
     m.add_function(wrap_pyfunction!(crc::py_crc32, m)?)?;
     m.add_function(wrap_pyfunction!(crc::py_crc16, m)?)?;
@@ -56,6 +56,9 @@ fn pyprotocols_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // WSLink constants
     protocols::wslink::register_constants(m)?;
+
+    // WSLink session (full async session with state machine)
+    m.add_class::<protocols::wslink_session::RustWSLinkSession>()?;
 
     // HSLink framer
     m.add_class::<protocols::hslink::HSLinkFramer>()?;

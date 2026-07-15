@@ -1,0 +1,154 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # Build native Rust wheels on each platform
+  build-wheels:
+    name: Build ${{ matrix.target }} wheel
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          # Linux ARM64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          # Windows ARM64 (cross-compile from x86_64)
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+          # macOS Intel
+          - os: macos-13
+            target: x86_64-apple-darwin
+          # macOS Apple Silicon
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install maturin
+        run: pip install maturin>=1.5
+
+      - name: Build wheel
+        working-directory: crates/protocols-core
+        run: maturin build --release --target ${{ matrix.target }} --out dist
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: crates/protocols-core/dist/*.whl
+
+  # Build pure Python fallback wheel
+  build-pure-python:
+    name: Build pure Python wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build wheel
+        run: python -m build --wheel --outdir dist/
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-pure-python
+          path: dist/*.whl
+
+  # Build MSYS2 pacman package
+  build-msys2:
+    name: Build MSYS2 pacman package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-pip
+            mingw-w64-ucrt-x86_64-rust
+
+      - name: Build pacman package
+        shell: msys2 {0}
+        working-directory: crates/protocols-core/msys2
+        run: |
+          # Install maturin in MSYS2
+          pip install maturin>=1.5
+          
+          # Build the package
+          MAKEFLAGS="-j$(nproc)" makepkg -sf --noconfirm
+          
+          # List output
+          ls -la *.pkg.tar.zst
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: msys2-package
+          path: crates/protocols-core/msys2/*.pkg.tar.zst
+
+  # Create GitHub Release with all assets
+  release:
+    name: Create Release
+    needs: [build-wheels, build-pure-python, build-msys2]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release
+          find artifacts -name '*.whl' -exec cp {} release/ \;
+          find artifacts -name '*.pkg.tar.zst' -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

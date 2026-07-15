@@ -3,7 +3,7 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "pyprotocols-core"
+name = "protocols"
 version = "1.1.0"
 description = "High-performance file transfer protocol core (Rust + PyO3)"
 requires-python = ">=3.9"
@@ -11,4 +11,5 @@ license = {text = "MIT"}
 
 [tool.maturin]
 features = ["pyo3/extension-module", "pyo3/abi3-py39"]
-module-name = "pyprotocols_core"
+python-source = "python"
+module-name = "protocols"

@@ -9,3 +9,13 @@ dgdg.py
 
 # Rust build artifacts
 crates/*/target/
+
+# Python build artifacts
+dist/
+*.whl
+*.egg-info/
+
+# Release artifacts (uploaded to GitHub Releases, not committed)
+release-v*/
+crates/*/dist/
+crates/*/msys2/*.pkg.tar.zst

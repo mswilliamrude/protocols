@@ -1,0 +1,14 @@
+# Build artifacts
+target/
+dist/
+*.whl
+*.egg-info/
+
+# Compiled extensions (prevent accidental commits)
+*.so
+*.pyd
+*.dll
+
+# Python cache
+__pycache__/
+*.pyc

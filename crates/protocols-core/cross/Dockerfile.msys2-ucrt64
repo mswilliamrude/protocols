@@ -1,0 +1,75 @@
+# Cross-compile pyprotocols-core for MSYS2 UCRT64
+# Build: docker build -f cross/Dockerfile.msys2-ucrt64 -t pyprotocols-msys2 .
+# Run:   docker run --rm -v $(pwd)/dist:/out pyprotocols-msys2
+
+FROM rust:1.79-bookworm
+
+# Install cross-compilation toolchain
+RUN apt-get update && apt-get install -y \
+    mingw-w64 \
+    python3 \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install maturin
+RUN pip3 install --break-system-packages maturin>=1.5
+
+# Add Windows GNU target (UCRT-compatible via gnullvm)
+RUN rustup target add x86_64-pc-windows-gnullvm
+
+# Configure cargo for cross-compilation
+RUN mkdir -p ~/.cargo && cat >> ~/.cargo/config.toml <<'EOF'
+[target.x86_64-pc-windows-gnullvm]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
+EOF
+
+WORKDIR /build
+
+# Copy source
+COPY . .
+
+# Build script
+RUN cat > /build.sh <<'EOF'
+#!/bin/bash
+set -e
+
+TARGET="x86_64-pc-windows-gnullvm"
+OUT_DIR="/out"
+
+echo "==> Building pyprotocols-core for MSYS2 UCRT64 ($TARGET)"
+
+# Build with maturin
+cd /build
+maturin build \
+    --release \
+    --target $TARGET \
+    --out /tmp/wheels \
+    --compatibility linux
+
+# The wheel will have wrong platform tag, fix it for MSYS2
+cd /tmp/wheels
+for whl in *.whl; do
+    # Rename: linux tag -> mingw (MSYS2 doesn't care about exact tag)
+    newname=$(echo "$whl" | sed 's/linux/win_amd64/g')
+    mv "$whl" "$newname" 2>/dev/null || true
+    
+    echo "==> Built: $newname"
+    cp "$newname" "$OUT_DIR/" 2>/dev/null || cp *.whl "$OUT_DIR/"
+done
+
+echo "==> Done! Wheel in $OUT_DIR"
+ls -la "$OUT_DIR"
+EOF
+
+RUN chmod +x /build.sh
+
+# Output directory
+VOLUME /out
+
+CMD ["/build.sh"]
